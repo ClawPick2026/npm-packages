@@ -60,6 +60,10 @@ Shared helper utilities used by `@firstpick/pi-extension-*` packages.
 
 `createLocalWikiEngine` centralizes local documentation corpus handling for wiki-style extensions: file discovery, Markdown/HTML parsing, section/link extraction, cache freshness, query expansion, search ranking, snippets, page reads, focused extracts, related links, and status payloads.
 
+## Tool result compatibility
+
+`TextToolResult` requires a `details` property to match Pi's `AgentToolResult` contract. `textToolResult()` returns `details: undefined` when no structured data is supplied, rather than omitting the property. `jsonToolResult()` retains the original payload as its details. `tests/reusable-utils.test.mjs` verifies explicit undefined, null, error flags, and JSON payload identity.
+
 ## Resource selector search
 
 For ordinary queries, `TuiResourceSelectorComponent.filterResources()` uses native Pi TUI `fuzzyFilter` over three cumulative field groups: name/display label, then discovery/source, then description. Each pass appends its matches in native fuzzy-score order and removes them from subsequent passes. Priority is strict, not a weighted score bonus. Multi-term queries can span fields; the earliest group that matches the whole query determines priority. The final group uses the original concatenated search text, preserving the existing match set. Native stable ties preserve caller order, and blank queries restore that order. Selection and persistence continue using resource names, not display labels or ranked positions.

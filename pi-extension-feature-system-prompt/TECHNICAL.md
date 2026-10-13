@@ -18,6 +18,7 @@ The extension decides whether a request is feature work before the main agent be
 - Requests that add a capability receive a short instruction to load `feature-development-workflow`.
 - Short follow-up messages can continue the previous feature decision when the connection is clear.
 - Delegated Pi child sessions skip this parent-only routing pass and follow the bounded task contract supplied by their parent.
+- Extension-generated custom messages are not classified as new user requests. They leave your previous request's classification available for later follow-ups.
 
 The complete feature workflow is not copied into every conversation. Pi loads it only when the request needs it.
 
