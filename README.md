@@ -121,6 +121,10 @@ Skills give Pi a reusable workflow for a particular kind of work. You normally a
 - **[Unslop](pi-skill-unslop/README.md)** — Strip AI writing tells from prose and restore a human voice.
 - **[Vulnerability Scanner](pi-skill-vulnerability-scanner/README.md)** — Check software, containers, and services for known vulnerabilities and explain the risk.
 
+### Local patch packages
+
+- **[Native Tasks for Pi in T3](patches/t3-pi-native-todo/README.md)** — A reviewed PATCH.md v2 package for compatible Linux desktop updates, with explicit approval, offline verification and receipt-based rollback. Keep the complete canonical package under T3's config outside userdata; the repository copy is a development mirror.
+
 ### Shared utilities
 
 These are building blocks for package authors and are usually installed indirectly.
