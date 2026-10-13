@@ -11,6 +11,10 @@ Contributor-only implementation, API, architecture, testing, and maintenance inf
 - `tests/follow-up-delivery.test.mjs` provides the extension lifecycle harness and end-to-end controller regressions without model or network calls.
 - `tests/goal-runtime.test.mjs` covers pure state, checkpoint, progress, restore, and bound behavior.
 
+## Pi 1.2 startup compatibility
+
+The native startup regression uses the selected SDK's `_startRun` and `_prepareRun` methods when present, alongside the older startup path. Its event adapter accepts the new discriminated trigger and legacy prompt arguments. Pi 1.2 marks preflight busy; pausing during a held `before_agent_start` therefore requests abort immediately, and the canceled controller delivery must still never reach the model boundary. Installed-session tests in `tests/pi-087-compat.test.mjs` independently cover durable resume, canonical history and actionable boundaries.
+
 ## Checklist flow
 
 The registered `todo_update` tool supplies full snapshots in all Pi modes. It validates and normalizes the entire input before mutation, checks both the tool and context abort signals, translates public statuses to the existing private checklist statuses, and replaces the ordered list directly. It updates visibility, clamps the existing scroll offset, records completion guidance, and consumes the post-compaction replacement allowance. It does not apply the Markdown overlap or status-delta heuristics. Identical snapshots do not append state or redraw the widget.

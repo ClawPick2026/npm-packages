@@ -34,7 +34,9 @@ import featureSystemPrompt, {
 	type RequestKind,
 } from "../feature-system-prompt.ts";
 
-type BeforeAgentStartEvent = { prompt: string; systemPrompt: string };
+type BeforeAgentStartEvent =
+	| { messageType?: "user"; prompt: string; systemPrompt: string }
+	| { messageType: "custom"; message: { customType: string; content: string; display: boolean }; systemPrompt: string };
 type BeforeAgentStartResult = { systemPrompt: string } | undefined;
 type TestContext = Pick<ExtensionContext, "model" | "mode" | "ui">;
 type BeforeAgentStartHandler = (event: BeforeAgentStartEvent, ctx: TestContext) => Promise<BeforeAgentStartResult>;
@@ -74,6 +76,9 @@ function createFeaturePromptHarness(dependencies: FeatureSystemPromptDependencie
 		statusUpdates,
 		run(prompt: string) {
 			return beforeAgentStart({ prompt, systemPrompt: "BASE" }, createContext(ACTIVE_MODEL, "tui"));
+		},
+		runCustom() {
+			return beforeAgentStart({ messageType: "custom", message: { customType: "continuation", content: "Continue", display: false }, systemPrompt: "BASE" }, createContext(ACTIVE_MODEL, "rpc"));
 		},
 		runInRpcMode(prompt: string) {
 			return beforeAgentStart({ prompt, systemPrompt: "BASE" }, createContext(ACTIVE_MODEL, "rpc"));
@@ -223,6 +228,25 @@ test("the handler model-routes ambiguous work but locally resolves obvious non-f
 
 	assert.deepEqual(classifierModels, [ACTIVE_MODEL]);
 	assert.deepEqual(classifierInputs, [{ prompt: "Add a command palette" }]);
+});
+
+test("Pi 1.2 custom-message starts skip classification without erasing user continuation state", async () => {
+	let classifications = 0;
+	const harness = createFeaturePromptHarness({
+		classifyRequest: async () => {
+			classifications += 1;
+			return classifierDecision("feature_complex");
+		},
+	});
+	assert.equal(await harness.runCustom(), undefined);
+	assert.equal(classifications, 0);
+	await harness.runInRpcMode("Add a command palette");
+	const statuses = [...harness.statusUpdates];
+	assert.equal(await harness.runCustom(), undefined);
+	assert.equal(classifications, 1);
+	assert.deepEqual(harness.statusUpdates, statuses);
+	assert.deepEqual(await harness.run("Continue"), { systemPrompt: injectedFeaturePrompt("feature_complex") });
+	assert.equal(classifications, 1);
 });
 
 test("a continuation without known local state still uses the active model without leaking prior text", async () => {

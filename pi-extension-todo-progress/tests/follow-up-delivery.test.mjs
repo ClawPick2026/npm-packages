@@ -1555,8 +1555,23 @@ test("native Pi startup preserves hooks and pause cancels a delayed continuation
     _modelRuntime: { hasConfiguredAuth: () => true },
     _baseSystemPromptOptions: { selectedTools: [] },
     _baseSystemPrompt: "Required external policy",
-    agent: { state: {} },
+    agent: { state: {}, prompt: async (messages) => native._runAgentPrompt(messages) },
     _pendingNextTurnMessages: [],
+    _pendingToolNames: new Set(),
+    _recordSelection() {},
+    _resolveIdleWaitIfIdle() {},
+    _handlePostAgentRun: async () => false,
+    _runBeforeSettleBoundary: async () => false,
+    _finishCancelledRetry() {},
+    _startRun: AgentSession.prototype._startRun,
+    async _prepareRun(trigger) {
+      harness.runtime.idle = false;
+      return AgentSession.prototype._prepareRun.call(this, trigger);
+    },
+    async _emitAgentSettled() {
+      this._isAgentRunActive = false;
+      harness.runtime.idle = true;
+    },
     _flushPendingBashMessages() {},
     _flushPendingCustomMessages() {},
     _findLastAssistantMessage() {},
@@ -1576,7 +1591,8 @@ test("native Pi startup preserves hooks and pause cancels a delayed continuation
         return { action: "transform", text: `Fixture input policy\n${text}`, images };
       },
       async emitBeforeAgentStart(prompt, images) {
-        const result = await harness.emit("before_agent_start", { prompt, images, systemPrompt: "Required external policy" });
+        const trigger = typeof prompt === "object" ? prompt : { messageType: "user", prompt, images };
+        const result = await harness.emit("before_agent_start", { ...trigger, systemPrompt: "Required external policy" });
         policies.push(result.systemPrompt);
         return { messages: [], systemPrompt: result.systemPrompt, systemPromptOptions: { selectedTools: [] } };
       },
@@ -1629,10 +1645,11 @@ test("native Pi startup preserves hooks and pause cancels a delayed continuation
   const delayed = AgentSession.prototype.sendUserMessage.call(native, delayedContinuation.content, delayedContinuation.options);
   await entered;
   await harness.command("goal-pause");
-  assert.equal(harness.runtime.abortCount, 0, "Pi is still idle during asynchronous preflight");
+  const startupIsBusy = typeof AgentSession.prototype._startRun === "function";
+  assert.equal(harness.runtime.abortCount, startupIsBusy ? 1 : 0, "Pi 1.2 counts asynchronous startup as busy, so pause requests abort immediately");
   releaseStartup();
   await delayed;
-  assert.equal(harness.runtime.abortCount, 1, "Canceled owned delivery must request native abort before model work");
+  assert.equal(harness.runtime.abortCount, startupIsBusy ? 2 : 1, "The canceled owned delivery must also request native abort before model work");
   assert.equal(modelContexts.length, 2, "Delayed canceled continuation cannot reach the model boundary");
   const filtered = await harness.emit("context", { messages: [userMessage(delayedContinuation.content)] });
   assert.ok(filtered.messages.every((message) => message.customType !== "todo-progress-goal-continuation"));

@@ -73,7 +73,9 @@ const classifierResourceLoader: ResourceLoader = {
 	getThemes: () => ({ themes: [], diagnostics: [] }),
 	getAgentsFiles: () => ({ agentsFiles: [] }),
 	getSystemPrompt: () => CLASSIFIER_SYSTEM_PROMPT,
+	getSystemPromptSource: () => undefined,
 	getAppendSystemPrompt: () => [],
+	getAppendSystemPromptSources: () => [],
 	extendResources: () => {},
 	reload: async () => {},
 };
@@ -355,6 +357,7 @@ export function createFeatureSystemPrompt(dependencies: FeatureSystemPromptDepen
 		pi.on("session_tree", resetSessionState);
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			if ("messageType" in event && event.messageType === "custom") return;
 			if (isSubagentChild()) {
 				resetContinuationState();
 				setFeatureStatuses(ctx, undefined, undefined);

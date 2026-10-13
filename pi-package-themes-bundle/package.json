@@ -26,9 +26,15 @@
       "./themes"
     ]
   },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
   "files": [
     "themes",
+    "webui-backgrounds.json",
     "README.md",
+    "TECHNICAL.md",
+    "DEVELOPMENT.md",
     "LICENSE"
   ]
 }
