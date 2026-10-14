@@ -1,11 +1,15 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendDisplayChunk, appendRunLog, createRunLog, formatElapsed, isCtrlC, isCtrlO, listRunLogs, outputLinesFromDisplay, saveRunLog, shellQuote, stripAnsi, type RunLog, type RunLogEntry } from "@firstpick/pi-utils";
+import { appendRunLog, createRunLog, formatElapsed, isCtrlC, isCtrlO, listRunLogs, saveRunLog, shellQuote, stripAnsi, type RunLog, type RunLogEntry } from "@firstpick/pi-utils";
 import { terminateProcessTree } from "./process-tree.ts";
+import { isKeyRelease, Key, matchesKey } from "@earendil-works/pi-tui";
+import { showPublishPicker } from "./publish-picker.ts";
+import { openReleaseOutputWindow, type ReleaseOutputWindow } from "./release-output-overlay.ts";
+import { compactReleaseView, SPINNER_INTERVAL_MS, spinnerFrame, type CompactReleaseView } from "./compact-release-output.ts";
 
 const RELEASE_STATUS_KEY = "release-npm";
 const RELEASE_LOG_WIDGET_KEY = "release-npm:logs";
@@ -168,6 +172,33 @@ function redactTokenLikeOutput(output: string): string {
   return output.replace(/npm_[A-Za-z0-9_=-]+/g, "npm_[redacted]").trim();
 }
 
+// Git Bash (MSYS) on Windows starts the script in a process whose Windows parent
+// is not the bash that Node spawned, so `taskkill /T` misses it and the script keeps
+// running. Record bash's MSYS PID and signal its process group with MSYS `kill`.
+function createMsysPidFile(): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  try {
+    return join(mkdtempSync(join(tmpdir(), "release-npm-")), "pid");
+  } catch {
+    return undefined;
+  }
+}
+
+function signalMsysProcessGroup(pidFile: string, signal: "INT" | "TERM" | "KILL"): void {
+  let pid = "";
+  try {
+    pid = readFileSync(pidFile, "utf8").trim();
+  } catch {
+    return;
+  }
+  if (!/^\d+$/.test(pid)) return;
+  spawnSync("bash", ["-c", `kill -${signal} -- -${pid} 2>/dev/null || kill -${signal} ${pid} 2>/dev/null`], {
+    stdio: "ignore",
+    windowsHide: true,
+    timeout: 5000,
+  });
+}
+
 async function runScriptLive(
   cwd: string,
   script: string,
@@ -176,14 +207,17 @@ async function runScriptLive(
 ): Promise<RunResult> {
   return await new Promise((resolve) => {
     let child: AbortableChild;
+    const msysPidFile = createMsysPidFile();
     try {
-      child = spawn("bash", ["-lc", script], {
+      child = spawn("bash", ["-lc", msysPidFile ? `echo $$ > "$RELEASE_NPM_PID_FILE"; ${script}` : script], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         detached: process.platform !== "win32",
+        env: msysPidFile ? { ...process.env, RELEASE_NPM_PID_FILE: msysPidFile } : process.env,
       }) as AbortableChild;
     } catch (error) {
       const output = `${spawnErrorOutput("bash", error)}\n`;
+      if (msysPidFile) rmSync(dirname(msysPidFile), { recursive: true, force: true });
       onChunk(output);
       resolve({ ok: false, output, aborted: false });
       return;
@@ -195,6 +229,7 @@ async function runScriptLive(
     const settle = (value: RunResult) => {
       if (settled) return;
       settled = true;
+      if (msysPidFile) rmSync(dirname(msysPidFile), { recursive: true, force: true });
       resolve(value);
     };
     const appendChunk = (chunk: string) => {
@@ -203,9 +238,12 @@ async function runScriptLive(
     };
     child.abortReleaseStep = () => {
       aborted = true;
-      terminateProcessTree(child, "SIGINT");
+      if (msysPidFile) signalMsysProcessGroup(msysPidFile, "INT");
+      else terminateProcessTree(child, "SIGINT");
       setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) terminateProcessTree(child, "SIGTERM");
+        if (settled) return;
+        if (msysPidFile) signalMsysProcessGroup(msysPidFile, "KILL");
+        terminateProcessTree(child, "SIGTERM");
       }, 1500).unref();
     };
 
@@ -313,6 +351,18 @@ function extractPlannedPublishes(output: string): PlannedPublish[] {
   });
 }
 
+// Same package discovery as the release scripts: top-level, non-hidden directories with a package.json.
+function listPackageDirs(cwd: string): string[] {
+  try {
+    return readdirSync(cwd, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && existsSync(join(cwd, entry.name, "package.json")))
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 function resolvePlannedPublishTargets(cwd: string, planned: PlannedPublish[]): { targets: PlannedPublishTarget[]; missing: PlannedPublish[] } {
   const packageNameToDir = new Map<string, string>();
   for (const entry of readdirSync(cwd, { withFileTypes: true })) {
@@ -344,7 +394,11 @@ function resolvePlannedPublishTargets(cwd: string, planned: PlannedPublish[]): {
 }
 
 function formatPreflightSummary(output: string): string {
-  const versionChanges = extractVersionChanges(output);
+  // Packages without publishable changes make up most of the list and need no
+  // decision, so leave them out and only report how many there were.
+  const allVersionChanges = extractVersionChanges(output);
+  const versionChanges = allVersionChanges.filter((line) => !line.endsWith(": unchanged (no publishable changes)"));
+  const hiddenCount = allVersionChanges.length - versionChanges.length;
   const bumpSummaries = stripAnsi(output)
     .split(/\r?\n/)
     .filter((line) => /^\s*- (would bump up|would reduce down|bumped up|reduced down|unchanged|first release \(no npm version\)|publish candidates|errors): /.test(line))
@@ -355,6 +409,7 @@ function formatPreflightSummary(output: string): string {
     "Release preflight summary:",
     "Version changes:",
     ...(versionChanges.length ? versionChanges.map((line) => `  ${line}`) : ["  none detected"]),
+    ...(hiddenCount ? [`  (${hiddenCount} package(s) without publishable changes not shown)`] : []),
     "Bump summary:",
     ...(bumpSummaries.length ? bumpSummaries.map((line) => `  ${line.trim()}`) : ["  unavailable"]),
     "Will publish:",
@@ -365,6 +420,19 @@ function formatPreflightSummary(output: string): string {
     ...(publishPlan.blocked.length ? publishPlan.blocked.map((line) => `  ${line}`) : ["  none"]),
     ...(publishPlan.other.length ? ["Other:", ...publishPlan.other.map((line) => `  ${line}`)] : []),
   ].join("\n");
+}
+
+// Rows the publish selector needs besides package options: borders, spacing, the
+// two-line title, key hints, the fixed choices (All, Publish selected, page
+// navigation, Cancel), and Pi's footer below the selector.
+const SELECTOR_RESERVED_ROWS = 20;
+const MIN_TARGET_PAGE_SIZE = 3;
+const NON_TTY_TARGET_PAGE_SIZE = 12;
+
+function selectorTargetPageSize(): number {
+  const rows = process.stdout.rows;
+  if (!rows) return NON_TTY_TARGET_PAGE_SIZE;
+  return Math.max(MIN_TARGET_PAGE_SIZE, rows - SELECTOR_RESERVED_ROWS);
 }
 
 const RELEASE_OUTPUT_KEY = `${RELEASE_STATUS_KEY}:output`;
@@ -468,7 +536,7 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("release-toggle", {
-    description: "Toggle active /release-npm output between compact and expanded modes",
+    description: "Show or hide the /release-npm output window (compact/expanded output outside the terminal UI)",
     handler: async (_args, ctx) => {
       if (!activeReleaseRun) {
         ctx.ui.notify("No active release output to toggle.", "warning");
@@ -522,7 +590,10 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       let cleanupReleaseUi: (() => void) | undefined;
       void (async () => {
       let liveBuffer = "";
-      let liveLines: string[] = [];
+      // The window shows a compact per-package view; the run log keeps the full output.
+      let compactCache: { length: number; spinner: string; view: CompactReleaseView } | undefined;
+      // Packages listed before their checks start, so every name shows up right away.
+      let expectedDirs = listPackageDirs(ctx.cwd);
       let expanded = false;
       let phase = "Release preflight checks";
       const startedAtMs = Date.now();
@@ -531,8 +602,25 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       let elapsedTimer: ReturnType<typeof setInterval> | undefined;
       let renderQueued = false;
       let uiClosed = false;
+      // Pi caps above-editor widgets at ten lines, so the terminal UI shows the live
+      // output in a scrollable overlay instead. RPC/Web UI clients keep the widgets.
+      const useOutputWindow = ctx.mode === "tui";
+      let outputWindow: ReleaseOutputWindow | undefined;
 
-      const outputLines = () => outputLinesFromDisplay(liveLines);
+      const outputView = () => {
+        // The spinner only turns while a script is running.
+        const spinner = currentChild ? spinnerFrame() : "";
+        if (compactCache?.length !== liveBuffer.length || compactCache.spinner !== spinner) {
+          const theme = ctx.ui.theme;
+          const view = compactReleaseView(liveBuffer, (tone, text) => theme.fg(tone, text), { expectedDirs, spinner: spinner || undefined });
+          compactCache = { length: liveBuffer.length, spinner, view };
+        }
+        return compactCache.view;
+      };
+      const outputLines = () => {
+        const { lines, summary } = outputView();
+        return summary ? [...lines, "", summary] : lines;
+      };
       const modeText = () => {
         const total = outputLines().length;
         const shown = expanded ? Math.min(EXPANDED_LINES, total) : Math.min(COLLAPSED_LINES, total);
@@ -540,6 +628,22 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       };
       const renderReleaseUiNow = () => {
         if (!ctx.hasUI || uiClosed) return;
+        if (useOutputWindow) {
+          outputWindow ??= openReleaseOutputWindow(
+            ctx,
+            () => {
+              const { lines, focusLine, summary } = outputView();
+              return { title: `release-npm: ${phase} · ${formatElapsed(startedAtMs)}`, lines, focusLine, footer: summary ? [summary] : [] };
+            },
+            {
+              onAbort: abortFromUser,
+              onHidden: () => ctx.ui.notify("Release output hidden; the release keeps running. Ctrl+O or /release-toggle shows it again.", "info"),
+              onError: (message) => ctx.ui.notify(`Release output window failed: ${message}`, "error"),
+            },
+          );
+          outputWindow.refresh();
+          return;
+        }
         const lines = outputLines();
         const limit = expanded ? EXPANDED_LINES : COLLAPSED_LINES;
         const visibleLines = lines.slice(-limit);
@@ -569,9 +673,15 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       };
       const startElapsedTimer = () => {
         if (!ctx.hasUI || elapsedTimer) return;
-        elapsedTimer = setInterval(() => renderReleaseUi(true), 1000);
+        // The terminal window redraws often enough to animate the spinner; widgets
+        // in RPC/Web UI clients update once a second to limit traffic.
+        elapsedTimer = setInterval(() => renderReleaseUi(true), useOutputWindow ? SPINNER_INTERVAL_MS : 1000);
       };
       const abortCurrentStep = () => currentChild?.abortReleaseStep?.();
+      const abortFromUser = () => {
+        ctx.ui.notify("Aborting release workflow...", "warning");
+        abortCurrentStep();
+      };
       const closeReleaseUi = () => {
         uiClosed = true;
         unsubscribeKeys?.();
@@ -579,6 +689,8 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
         if (elapsedTimer) clearInterval(elapsedTimer);
         elapsedTimer = undefined;
         activeReleaseRun = undefined;
+        outputWindow?.close();
+        outputWindow = undefined;
         if (ctx.hasUI) {
           ctx.ui.setWidget(RELEASE_OUTPUT_KEY, undefined);
           ctx.ui.setWidget(RELEASE_FOOTER_KEY, undefined);
@@ -587,40 +699,50 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       };
       cleanupReleaseUi = closeReleaseUi;
       const toggleOutput = () => {
+        if (outputWindow) {
+          outputWindow.toggle();
+          return;
+        }
         expanded = !expanded;
         renderReleaseUi(true);
       };
       const resetLiveOutput = () => {
         liveBuffer = "";
-        liveLines = [];
+        compactCache = undefined;
         uiClosed = false;
         renderReleaseUi(true);
       };
       const finishLog = (status: string, summary?: string) => saveReleaseRunLog(runLog, status, summary);
       const appendOutput = (chunk: string) => {
         liveBuffer += chunk;
-        appendDisplayChunk(liveLines, chunk);
         appendReleaseLog(runLog, chunk);
         renderReleaseUi();
       };
+      const subscribeReleaseKeys = () => {
+        if (!ctx.hasUI || unsubscribeKeys) return;
+        unsubscribeKeys = ctx.ui.onTerminalInput((data) => {
+          if (isKeyRelease(data)) return undefined;
+          if (isCtrlO(data) || matchesKey(data, Key.ctrl("o"))) {
+            toggleOutput();
+            return { consume: true };
+          }
+          if (isCtrlC(data) || matchesKey(data, Key.ctrl("c"))) {
+            abortFromUser();
+            return { consume: true };
+          }
+        });
+      };
+      const outputLocationText = useOutputWindow
+        ? "Output opens in a scrollable window; Esc or Ctrl+O hides it and Ctrl+O shows it again."
+        : "Output stays above input; controls are below input.";
       activeReleaseRun = { abort: abortCurrentStep, toggleOutput };
 
       if (ctx.hasUI) {
         ctx.ui.setStatus(RELEASE_STATUS_KEY, ctx.ui.theme.fg("accent", "Release:Checking"));
-        notifyProgress("Running release preflight checks. Output stays above input; controls are below input.", "info");
+        notifyProgress(`Running release preflight checks. ${outputLocationText}`, "info");
         renderReleaseUi(true);
         startElapsedTimer();
-        unsubscribeKeys = ctx.ui.onTerminalInput((data) => {
-          if (isCtrlO(data)) {
-            toggleOutput();
-            return { consume: true };
-          }
-          if (isCtrlC(data)) {
-            ctx.ui.notify("Aborting release workflow...", "warning");
-            abortCurrentStep();
-            return { consume: true };
-          }
-        });
+        subscribeReleaseKeys();
       }
 
       const planCommand = releaseScriptCommand(ctx.cwd, "release-workflow.sh", ["--plan", "--all"]);
@@ -675,27 +797,52 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
         ? `Publish selected packages (${count})`
         : "Publish selected packages";
       const formatSelectableTarget = (target: PlannedPublishTarget, selected: boolean) => `${selected ? "[x]" : "[ ]"} ${target.target}`;
-      const selectedTargetsText = (selectedTargets: Set<string>) => {
-        const selected = plannedTargetResolution.targets.filter((target) => selectedTargets.has(target.target));
-        return selected.length
-          ? selected.map((target) => `  - ${target.label} (${target.action}; target ${target.target})`).join("\n")
-          : "  none selected yet";
-      };
+      // Outside the terminal UI (RPC, Web UI) the native selector prints its title and
+      // every option without scrolling, so a long summary or package list pushes the
+      // choices off-screen. Post the full summary to the chat first, keep the title
+      // short, and page the package options.
+      const targetPageSize = selectorTargetPageSize();
+      const targetPageCount = Math.max(1, Math.ceil(plannedTargetResolution.targets.length / targetPageSize));
+      const nextPageChoice = (page: number) => `Next packages (page ${page + 2}/${targetPageCount})`;
+      const previousPageChoice = (page: number) => `Previous packages (page ${page}/${targetPageCount})`;
       const choosePublishTargets = async (): Promise<PlannedPublishTarget[] | undefined> => {
+        // In the terminal UI, show the summary and package list in a scrollable overlay.
+        if (ctx.mode === "tui") return await showPublishPicker(ctx, `${preflightSummary}\n\n${targetSummary}`, plannedTargetResolution.targets);
+        ctx.ui.notify(`${preflightSummary}\n\n${targetSummary}`, "info");
         const selectedTargets = new Set<string>();
+        let page = 0;
         while (true) {
+          const pageTargets = plannedTargetResolution.targets.slice(page * targetPageSize, (page + 1) * targetPageSize);
           const targetOptionMap = new Map<string, PlannedPublishTarget>();
-          const targetOptions = plannedTargetResolution.targets.map((target) => {
+          const targetOptions = pageTargets.map((target) => {
             const option = formatSelectableTarget(target, selectedTargets.has(target.target));
             targetOptionMap.set(option, target);
             return option;
           });
+          const hasPreviousPage = page > 0;
+          const hasNextPage = page < targetPageCount - 1;
+          const pageText = targetPageCount > 1 ? ` · packages page ${page + 1}/${targetPageCount}` : "";
           const choice = await ctx.ui.select(
-            `${preflightSummary}\n\n${targetSummary}\n\nPublish eligible packages now?\nUse All to publish every eligible package, or toggle package buttons and then publish the selected set.\n\nSelected:\n${selectedTargetsText(selectedTargets)}`,
-            [allTargetsChoice, publishSelectedChoice(selectedTargets.size), ...targetOptions, cancelChoice],
+            `Publish eligible packages now? ${selectedTargets.size}/${plannedTargetResolution.targets.length} selected${pageText}\nChoose All, or toggle packages and publish the selected set. The full preflight summary is in the chat above.`,
+            [
+              allTargetsChoice,
+              publishSelectedChoice(selectedTargets.size),
+              ...targetOptions,
+              ...(hasPreviousPage ? [previousPageChoice(page)] : []),
+              ...(hasNextPage ? [nextPageChoice(page)] : []),
+              cancelChoice,
+            ],
           );
           if (choice === allTargetsChoice) return plannedTargetResolution.targets;
           if (choice === cancelChoice || !choice) return undefined;
+          if (hasNextPage && choice === nextPageChoice(page)) {
+            page += 1;
+            continue;
+          }
+          if (hasPreviousPage && choice === previousPageChoice(page)) {
+            page -= 1;
+            continue;
+          }
           if (choice === publishSelectedChoice(selectedTargets.size)) {
             if (selectedTargets.size === 0) {
               ctx.ui.notify("Select at least one package, choose All, or cancel the release.", "warning");
@@ -731,13 +878,15 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
 
       phase = "Release publishing";
       expanded = false;
+      expectedDirs = selectedPublishTargets.map((target) => target.target);
       resetLiveOutput();
       activeReleaseRun = { abort: abortCurrentStep, toggleOutput };
       if (ctx.hasUI) {
         ctx.ui.setStatus(RELEASE_STATUS_KEY, ctx.ui.theme.fg("accent", "Release:Publishing"));
-        notifyProgress("Starting publish workflow. Output stays above input; controls are below input.", "info");
+        notifyProgress(`Starting publish workflow. ${outputLocationText}`, "info");
         renderReleaseUi(true);
         startElapsedTimer();
+        subscribeReleaseKeys();
       }
 
       notifyProgress(`Running publish workflow for ${selectedPublishTargets.length} selected target(s)...`, "info");
