@@ -392,6 +392,43 @@ export async function countUnpushedCommits(root: string, runner: GitRunner = run
   return count;
 }
 
+export interface CommitSummary {
+  shortOid: string;
+  subject: string;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+}
+
+/** Read a display summary of one commit: abbreviated ID, subject, and diff size against its first parent. */
+export async function describeCommit(root: string, oid: string, runner: GitRunner = runGit): Promise<CommitSummary> {
+  if (!/^[0-9a-f]{40,64}$/u.test(oid)) throw new GuidedGitError("INVALID_HEAD", "Commit object ID is invalid");
+  const header = (await requireGit(root, ["show", "-s", "--no-show-signature", "--format=%h%x00%s", oid, "--"], runner)).toString("utf8").trim();
+  const [shortOid = "", subject = ""] = header.split("\0");
+  if (!/^[0-9a-f]{4,64}$/u.test(shortOid)) throw new GuidedGitError("GIT_OUTPUT_INVALID", "Git returned an invalid abbreviated commit ID");
+  const stat = (await requireGit(root, ["diff-tree", "--root", "--no-commit-id", "--shortstat", "-r", oid, "--"], runner)).toString("utf8");
+  const read = (pattern: RegExp) => Number.parseInt(pattern.exec(stat)?.[1] ?? "0", 10);
+  return {
+    shortOid,
+    subject: sanitizeDiagnostic(subject, 200),
+    filesChanged: read(/(\d+) files? changed/u),
+    insertions: read(/(\d+) insertions?\(\+\)/u),
+    deletions: read(/(\d+) deletions?\(-\)/u),
+  };
+}
+
+/** Count commits reachable from `oid` that no remote-tracking branch of `remote` contains, without fetching. Returns null when it cannot be determined safely. */
+export async function countCommitsMissingFromRemote(root: string, oid: string, remote: string, runner: GitRunner = runGit): Promise<number | null> {
+  if (!/^[0-9a-f]{40,64}$/u.test(oid) || remote.startsWith("-") || /[*?[\\\x00-\x20\x7f]/u.test(remote)) return null;
+  const refs = await runner(root, ["for-each-ref", "--format=%(objectname)", `refs/remotes/${remote}/`]);
+  if (refs.exitCode !== 0 || refs.timedOut) return null;
+  const tips = refs.stdout.toString("ascii").split(/\r?\n/u).filter((line) => /^[0-9a-f]{40,64}$/u.test(line));
+  const result = await runner(root, ["rev-list", "--count", oid, ...(tips.length ? ["--not", ...tips] : []), "--"]);
+  if (result.exitCode !== 0 || result.timedOut) return null;
+  const text = result.stdout.toString("ascii").trim();
+  return /^\d+$/u.test(text) ? Number.parseInt(text, 10) : null;
+}
+
 function assertNoUnsafeControls(message: string): void {
   if (/\x1b|[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(message)) {
     throw new GuidedGitError("UNSAFE_COMMIT_MESSAGE", "Commit messages may contain newlines but no other control characters, bidirectional controls, or terminal escapes");

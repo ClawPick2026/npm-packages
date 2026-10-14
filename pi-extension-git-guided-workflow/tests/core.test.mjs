@@ -12,7 +12,9 @@ import {
   acquireStableStagedSnapshot,
   captureBoundStagedState,
   classifyPostCommitHead,
+  countCommitsMissingFromRemote,
   countUnpushedCommits,
+  describeCommit,
   discoverPushDestination,
   parseGeneratedOutput,
   parsePorcelainStatus,
@@ -182,6 +184,26 @@ test("countUnpushedCommits counts HEAD commits missing from every remote-trackin
     ? { exitCode: 0, timedOut: false, stdout: Buffer.from(`${"a".repeat(40)}\n`), stderr: Buffer.alloc(0) }
     : { exitCode: 0, timedOut: false, stdout: Buffer.from("many\n"), stderr: Buffer.alloc(0) };
   await assertCode(countUnpushedCommits(root, fakeRunner), "GIT_OUTPUT_INVALID");
+});
+
+test("describeCommit and countCommitsMissingFromRemote summarize a commit and its outgoing count", async () => {
+  const root = await repository("describe");
+  const first = git(root, "rev-parse", "HEAD");
+  assert.deepEqual(await describeCommit(root, first), { shortOid: first.slice(0, 7), subject: "test: initial", filesChanged: 1, insertions: 1, deletions: 0 });
+  await writeFile(path.join(root, "tracked.txt"), "changed\n");
+  await writeFile(path.join(root, "added.txt"), "a\nb\n");
+  git(root, "add", "--all");
+  git(root, "commit", "-m", "feat: \u001b[31mcolored subject");
+  const second = git(root, "rev-parse", "HEAD");
+  assert.deepEqual(await describeCommit(root, second), { shortOid: second.slice(0, 7), subject: "feat: colored subject", filesChanged: 2, insertions: 3, deletions: 1 });
+  await assertCode(describeCommit(root, "HEAD"), "INVALID_HEAD");
+  const bare = await tempDir("describe-remote.git");
+  git(bare, "init", "--bare");
+  git(root, "remote", "add", "origin", bare);
+  assert.equal(await countCommitsMissingFromRemote(root, second, "origin"), 2);
+  git(root, "push", "origin", `${first}:refs/heads/main`);
+  assert.equal(await countCommitsMissingFromRemote(root, second, "origin"), 1);
+  assert.equal(await countCommitsMissingFromRemote(root, second, "orig*"), null);
 });
 
 test("package-domain fingerprint detects staged path, mode, blob, and content changes, including unborn repositories", async () => {

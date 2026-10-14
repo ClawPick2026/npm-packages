@@ -965,6 +965,9 @@ test("manual no-model flow commits in a temporary repository and offers Finish w
   assert.equal(git(root, "log", "-1", "--pretty=%B"), "feat: commit manual change");
   assert.deepEqual(screens.map(({ title }) => title), ["Choose a commit message", "Review commit", "No Git remote configured"], "staged-only repositories skip Stage and the message goes straight to review");
   assert.match(screens[1].detail, /Message \(exact\):\nfeat: commit manual change\n/u);
+  const created = git(root, "rev-parse", "HEAD");
+  assert.ok(harness.notifications.some(({ message, type }) => type === "info"
+    && message === `Created commit ${created.slice(0, 7)} "feat: commit manual change" (1 file changed, +1 −1) on main.\nFull ID: ${created}`), JSON.stringify(harness.notifications));
   assert.equal(harness.confirmations.length, 0, "commit runs from Review commit without a confirmation");
   assert.ok(harness.renders.some(({ normal }) => /No Git remote configured/u.test(normal.join("\n"))));
   assert.equal(harness.remainingActions.length, 0);
@@ -1839,6 +1842,8 @@ test("Review push shows the exact local remote, branch, and refspec and Continue
   assert.match(review.detail, new RegExp(`Remote: origin\nBranch: main\nRefspec: ${localHead}:refs/heads/main\n\nCommand: git push -- origin ${localHead}:refs/heads/main`, "u"));
   assert.doesNotMatch(review.detail, /--force/iu);
   assert.equal(harness.confirmations.length, 0, "Continue and push runs without a confirmation");
+  assert.ok(harness.notifications.some(({ message, type }) => type === "info"
+    && message === `Pushed to origin/main (2 new commits). HEAD is ${localHead.slice(0, 7)} "feat: push exact refspec" (1 file changed, +1 −1).\nFull ID: ${localHead}`), JSON.stringify(harness.notifications));
 });
 
 test("push credential failures explain external authentication without retrying or creating another commit", async () => {

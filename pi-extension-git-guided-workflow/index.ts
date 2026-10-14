@@ -11,7 +11,9 @@ import {
   GuidedGitError,
   captureBoundStagedState,
   classifyPostCommitHead,
+  countCommitsMissingFromRemote,
   countUnpushedCommits,
+  describeCommit,
   discoverPushDestination,
   parseGeneratedOutput,
   planPush,
@@ -337,6 +339,20 @@ async function finishScreen(ctx: ExtensionCommandContext, stage: StageName, mess
 
 async function executePlan(root: string, args: readonly string[], timeoutMs: number) {
   return await runGit(root, args, { timeoutMs, maxStdoutBytes: 1024 * 1024, maxStderrBytes: 128 * 1024 });
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+async function commitSummaryText(root: string, oid: string): Promise<string> {
+  try {
+    const summary = await describeCommit(root, oid);
+    const size = `${plural(summary.filesChanged, "file")} changed, +${summary.insertions} −${summary.deletions}`;
+    return `${summary.shortOid} "${confirmationValue(summary.subject)}" (${size})`;
+  } catch {
+    return oid;
+  }
 }
 
 function pushFailureMessage(diagnostic: string): string {
@@ -760,7 +776,8 @@ async function commitStage(
     const classification = classifyPostCommitHead(binding.headOid, after, outcome);
     if (classification.classification === "head-advanced" && classification.commitOid) {
       if (outcome !== "success") ctx.ui.notify("The commit command reported a problem, but HEAD advanced. The created commit was preserved and will not be retried.", "warning");
-      else ctx.ui.notify(`Created commit ${classification.commitOid}.`, "info");
+      else ctx.ui.notify(`Created commit ${await commitSummaryText(state.root, classification.commitOid)} on ${confirmationValue(state.branch)}.
+Full ID: ${classification.commitOid}`, "info");
       return { kind: "created", oid: classification.commitOid };
     }
     if (classification.classification === "not-created") {
@@ -801,6 +818,8 @@ async function publishRepository(
   if (!confirmed) return;
   const outcome = await executeRepositoryPublication(plan, { assertCurrent: () => assertCurrent(active) });
   if (outcome.status === "published") {
+    ctx.ui.notify(`Published ${plan.visibility} repository ${exactTarget} and pushed ${confirmationValue(plan.branch)}. HEAD is ${await commitSummaryText(state.root, plan.headOid)}.
+Full ID: ${plan.headOid}`, "info");
     await finishScreen(ctx, "Push", `Published ${exactTarget} and pushed ${plan.headOid}.`);
   } else {
     await finishScreen(ctx, "Push", `Publication result is uncertain: ${outcome.diagnostic}\nDo not retry automatically. Inspect GitHub and local remotes first.`);
@@ -893,9 +912,14 @@ async function pushStage(
       continue;
     }
     const plan = planPush(verifiedDestination, createdOid, currentHead);
+    const outgoing = await countCommitsMissingFromRemote(state.root, createdOid, verifiedDestination.remote);
     try {
       const result = await executePlan(state.root, plan.args, PUSH_TIMEOUT_MS);
       if (result.exitCode === 0 && !result.timedOut) {
+        const target = `${confirmationValue(verifiedDestination.remote)}/${confirmationValue(verifiedDestination.branch)}`;
+        const count = outgoing === null ? "" : outgoing === 0 ? " (the remote already had these commits)" : ` (${plural(outgoing, "new commit")})`;
+        ctx.ui.notify(`Pushed to ${target}${count}. HEAD is ${await commitSummaryText(state.root, createdOid)}.
+Full ID: ${createdOid}`, "info");
         await finishScreen(ctx, "Push", `Pushed ${createdOid}\nRemote: ${verifiedDestination.remote}\nBranch: ${verifiedDestination.branch}\nRefspec: ${verifiedDestination.refspec}`);
         return;
       }
