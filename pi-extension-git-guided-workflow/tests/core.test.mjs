@@ -241,6 +241,43 @@ test("stable snapshots bind before/diff/after, refuse races, and refuse rather t
   await assertCode(acquireStableStagedSnapshot(root, { maxBytes: 32 }), "GENERATION_INPUT_TOO_LARGE");
 });
 
+test("runGit uses system credential helpers and honors an inherited system-config opt-out", async () => {
+  const root = await tempDir("system-credentials");
+  const systemConfig = path.join(root, "system.gitconfig");
+  const globalConfig = path.join(root, "global.gitconfig");
+  const helper = "!f() { printf '%s\\n' 'username=fixture-user' 'password=fixture-only-token'; }; f";
+  git(root, "config", "--file", systemConfig, "credential.helper", helper);
+  await writeFile(globalConfig, "");
+  const keys = ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_TERMINAL_PROMPT"];
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.GIT_CONFIG_SYSTEM = systemConfig;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    delete process.env.GIT_CONFIG_NOSYSTEM;
+    process.env.GIT_ASKPASS = "";
+    process.env.SSH_ASKPASS = "";
+    process.env.GIT_TERMINAL_PROMPT = "1";
+    const args = ["-c", "core.askPass=", "-c", "alias.fixture-credentials=!printf 'protocol=https\\nhost=credentials.example.invalid\\n\\n' | git credential fill", "fixture-credentials"];
+    const result = await runGit(root, args);
+    assert.equal(result.exitCode, 0, result.stderr.toString());
+    assert.match(result.stdout.toString(), /username=fixture-user/u);
+    assert.match(result.stdout.toString(), /password=fixture-only-token/u);
+    assert.equal(result.stderr.length, 0);
+
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    const withoutSystem = await runGit(root, args);
+    assert.notEqual(withoutSystem.exitCode, 0);
+    assert.match(withoutSystem.stderr.toString(), /terminal prompts disabled/u);
+    assert.doesNotMatch(withoutSystem.stderr.toString(), /\/dev\/tty/u);
+    assert.doesNotMatch(withoutSystem.stdout.toString(), /fixture-only-token/u);
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
+  }
+});
+
 test("runGit settles output-limit errors only after close and bounds unconfirmed termination", async () => {
   const root = await repository("run-git-settlement");
   let closedError;

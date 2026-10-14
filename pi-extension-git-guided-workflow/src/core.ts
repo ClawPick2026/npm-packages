@@ -69,7 +69,9 @@ export const runGit: GitRunner = (cwd, args, options = {}) => new Promise((resol
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_CONFIG_NOSYSTEM: "1", LC_ALL: "C" },
+    // Keep normal credential helpers, including Git for Windows' system helper.
+    // This child has no terminal input; configured helpers and askpass still work.
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" },
   });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
