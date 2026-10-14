@@ -3,11 +3,11 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { appendRunLog, createRunLog, formatElapsed, isCtrlC, isCtrlO, listRunLogs, saveRunLog, shellQuote, stripAnsi, type RunLog, type RunLogEntry } from "@firstpick/pi-utils";
 import { terminateProcessTree } from "./process-tree.ts";
 import { isKeyRelease, Key, matchesKey } from "@earendil-works/pi-tui";
-import { showPublishPicker } from "./publish-picker.ts";
+import { showCheckPicker, showPublishPicker } from "./publish-picker.ts";
 import { openReleaseOutputWindow, type ReleaseOutputWindow } from "./release-output-overlay.ts";
 import { compactReleaseView, SPINNER_INTERVAL_MS, spinnerFrame, type CompactReleaseView } from "./compact-release-output.ts";
 
@@ -435,6 +435,90 @@ function selectorTargetPageSize(): number {
   return Math.max(MIN_TARGET_PAGE_SIZE, rows - SELECTOR_RESERVED_ROWS);
 }
 
+// Package directories with staged, unstaged, or untracked changes. Empty outside a Git repository.
+function listChangedPackageDirs(cwd: string, packages: string[]): Set<string> {
+  const git = (args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true });
+  const prefixResult = git(["rev-parse", "--show-prefix"]);
+  const statusResult = git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."]);
+  if (prefixResult.status !== 0 || statusResult.status !== 0) return new Set();
+  // Porcelain paths are relative to the repository root, not to cwd.
+  const prefix = prefixResult.stdout.trim();
+  const known = new Set(packages);
+  const changed = new Set<string>();
+  const entries = statusResult.stdout.split("\0");
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.length < 4) continue;
+    const paths = [entry.slice(3)];
+    // Renames and copies are followed by their original path.
+    if (/[RC]/.test(entry.slice(0, 2))) paths.push(entries[++index] ?? "");
+    for (const path of paths) {
+      if (!path.startsWith(prefix)) continue;
+      const dir = path.slice(prefix.length).split("/")[0];
+      if (known.has(dir)) changed.add(dir);
+    }
+  }
+  return changed;
+}
+
+// Package choice before preflight checks. Every package starts selected.
+async function chooseCheckTargets(ctx: ExtensionCommandContext, packages: string[]): Promise<string[] | undefined> {
+  const changed = listChangedPackageDirs(ctx.cwd, packages);
+  if (ctx.mode === "tui") return await showCheckPicker(ctx, packages, changed);
+  if (!ctx.hasUI) return packages;
+  // Remote clients get Pi's standard choice prompt, paged like the publish selector.
+  const selected = new Set(packages);
+  const pageSize = selectorTargetPageSize();
+  const pageCount = Math.max(1, Math.ceil(packages.length / pageSize));
+  const selectAllChoice = "Select all";
+  const deselectAllChoice = "Deselect all";
+  const cancelChoice = "Cancel";
+  let page = 0;
+  while (true) {
+    const startChoice = `Start checks (${selected.size} selected)`;
+    const nextPageChoice = `Next packages (page ${page + 2}/${pageCount})`;
+    const previousPageChoice = `Previous packages (page ${page}/${pageCount})`;
+    const pagePackages = packages.slice(page * pageSize, (page + 1) * pageSize);
+    const optionMap = new Map(pagePackages.map((name) => [
+      `${selected.has(name) ? "[x]" : "[ ]"} ${name}${changed.has(name) ? " ● uncommitted changes" : ""}`,
+      name,
+    ]));
+    const hasPreviousPage = page > 0;
+    const hasNextPage = page < pageCount - 1;
+    const pageText = pageCount > 1 ? ` · page ${page + 1}/${pageCount}` : "";
+    const choice = await ctx.ui.select(
+      `Which packages should release-npm check? ${selected.size}/${packages.length} selected${changed.size ? ` · ${changed.size} with uncommitted changes (●)` : ""}${pageText}`,
+      [
+        startChoice,
+        selectAllChoice,
+        deselectAllChoice,
+        ...optionMap.keys(),
+        ...(hasPreviousPage ? [previousPageChoice] : []),
+        ...(hasNextPage ? [nextPageChoice] : []),
+        cancelChoice,
+      ],
+    );
+    if (choice === cancelChoice || !choice) return undefined;
+    if (choice === startChoice) {
+      if (selected.size === 0) {
+        ctx.ui.notify("Select at least one package, or cancel the release.", "warning");
+        continue;
+      }
+      return packages.filter((name) => selected.has(name));
+    }
+    if (choice === selectAllChoice) packages.forEach((name) => selected.add(name));
+    else if (choice === deselectAllChoice) selected.clear();
+    else if (hasNextPage && choice === nextPageChoice) page += 1;
+    else if (hasPreviousPage && choice === previousPageChoice) page -= 1;
+    else {
+      const name = optionMap.get(choice);
+      if (!name) continue;
+      if (selected.has(name)) selected.delete(name);
+      else selected.add(name);
+    }
+  }
+}
+
 const RELEASE_OUTPUT_KEY = `${RELEASE_STATUS_KEY}:output`;
 const RELEASE_FOOTER_KEY = `${RELEASE_STATUS_KEY}:footer`;
 const EXPANDED_LINES = 160;
@@ -584,7 +668,17 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
 
       const username = authResult.output.trim();
       const authSummary = `npm authentication verified${username ? ` as ${username}` : ""}.`;
-      notifyProgress(`${authSummary} Starting release preflight...`, "success");
+      notifyProgress(authSummary, "success");
+
+      const packageDirs = listPackageDirs(ctx.cwd);
+      const checkTargets = packageDirs.length ? await chooseCheckTargets(ctx, packageDirs) : packageDirs;
+      if (!checkTargets) {
+        ctx.ui.notify("Release cancelled before preflight checks.", "info");
+        return;
+      }
+      const checkAll = checkTargets.length === packageDirs.length;
+      const planArgs = checkAll ? ["--plan", "--all"] : ["--plan", "--targets", checkTargets.join(",")];
+      const planStep = `release-workflow.sh ${checkAll ? "--plan --all" : `--plan --targets (${checkTargets.length} packages)`}`;
 
       const runLog = createReleaseRunLog(ctx.cwd);
       let cleanupReleaseUi: (() => void) | undefined;
@@ -593,7 +687,7 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
       // The window shows a compact per-package view; the run log keeps the full output.
       let compactCache: { length: number; spinner: string; view: CompactReleaseView } | undefined;
       // Packages listed before their checks start, so every name shows up right away.
-      let expectedDirs = listPackageDirs(ctx.cwd);
+      let expectedDirs = checkTargets;
       let expanded = false;
       let phase = "Release preflight checks";
       const startedAtMs = Date.now();
@@ -745,9 +839,10 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
         subscribeReleaseKeys();
       }
 
-      const planCommand = releaseScriptCommand(ctx.cwd, "release-workflow.sh", ["--plan", "--all"]);
-      notifyProgress("Running release-workflow.sh --plan --all...", "info");
+      const planCommand = releaseScriptCommand(ctx.cwd, "release-workflow.sh", planArgs);
+      notifyProgress(`Running ${planStep}...`, "info");
       appendOutput(`${authSummary}\n`);
+      appendReleaseLog(runLog, `Checked packages: ${checkAll ? `all (${checkTargets.length})` : checkTargets.join(", ")}\n`);
       appendOutput(`$ ${planCommand}\n`);
       const plan = await runScriptLive(ctx.cwd, planCommand, appendOutput, (child) => { currentChild = child; });
       currentChild = undefined;
@@ -765,7 +860,7 @@ export default function releaseNpmExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`release-workflow preflight failed; publish was not offered.${logPath ? ` Log: ${logPath}` : ""}`, "error");
         if (ctx.hasUI) ctx.ui.setStatus(RELEASE_STATUS_KEY, ctx.ui.theme.fg("error", "Release:Failed"));
         closeReleaseUi();
-        evaluateFailureWithLLM(pi, "release-workflow.sh --plan --all", plan.output);
+        evaluateFailureWithLLM(pi, planStep, plan.output);
         return;
       }
 

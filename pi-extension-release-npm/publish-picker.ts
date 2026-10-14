@@ -151,6 +151,108 @@ function renderPanel(lines: string[], width: number, theme: Theme): string[] {
   ];
 }
 
+/**
+ * Package checklist shown before preflight checks start. Every package starts
+ * selected; Ctrl+A selects all and Ctrl+X clears the selection.
+ */
+class CheckPickerOverlay {
+  private readonly tui: TUI;
+  private readonly theme: Theme;
+  private readonly packages: readonly string[];
+  private readonly changed: ReadonlySet<string>;
+  private readonly done: (result: string[] | undefined) => void;
+  private readonly selected: Set<number>;
+  private cursor = 0;
+  private listOffset = 0;
+  private listPageSize = 1;
+  private message = "";
+
+  constructor(tui: TUI, theme: Theme, packages: readonly string[], changed: ReadonlySet<string>, done: (result: string[] | undefined) => void) {
+    this.tui = tui;
+    this.theme = theme;
+    this.packages = packages;
+    this.changed = changed;
+    this.done = done;
+    this.selected = new Set(packages.map((_name, index) => index));
+  }
+
+  handleInput(data: string): void {
+    this.message = "";
+    const last = this.packages.length - 1;
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      this.done(undefined);
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      if (this.selected.size === 0) {
+        this.message = "Nothing selected. Space toggles a package, Ctrl+A selects all, Esc cancels.";
+      } else {
+        this.done(this.packages.filter((_name, index) => this.selected.has(index)));
+        return;
+      }
+    } else if (matchesKey(data, Key.ctrl("a"))) this.packages.forEach((_name, index) => this.selected.add(index));
+    else if (matchesKey(data, Key.ctrl("x"))) this.selected.clear();
+    else if (matchesKey(data, Key.space)) {
+      if (this.selected.has(this.cursor)) this.selected.delete(this.cursor);
+      else this.selected.add(this.cursor);
+    } else if (matchesKey(data, Key.up) || data === "k") this.cursor = Math.max(0, this.cursor - 1);
+    else if (matchesKey(data, Key.down) || data === "j") this.cursor = Math.min(last, this.cursor + 1);
+    else if (matchesKey(data, Key.pageUp)) this.cursor = Math.max(0, this.cursor - this.listPageSize);
+    else if (matchesKey(data, Key.pageDown)) this.cursor = Math.min(last, this.cursor + this.listPageSize);
+    else if (matchesKey(data, Key.home)) this.cursor = 0;
+    else if (matchesKey(data, Key.end)) this.cursor = last;
+    this.tui.requestRender();
+  }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    const theme = this.theme;
+    const terminalRows = Math.max(1, Math.floor(this.tui.terminal?.rows ?? 24));
+    // Frame (2) + title (1) + list header (1) + help/message (1).
+    this.listPageSize = Math.max(1, Math.min(this.packages.length, Math.floor(terminalRows * 0.9) - 5));
+    if (this.cursor < this.listOffset) this.listOffset = this.cursor;
+    if (this.cursor >= this.listOffset + this.listPageSize) this.listOffset = this.cursor - this.listPageSize + 1;
+    this.listOffset = Math.min(this.listOffset, Math.max(0, this.packages.length - this.listPageSize));
+
+    const visible = this.packages.slice(this.listOffset, this.listOffset + this.listPageSize);
+    const range = this.packages.length > visible.length
+      ? ` ${this.listOffset + 1}-${this.listOffset + visible.length}/${this.packages.length}`
+      : ` (${this.packages.length})`;
+    const changedText = this.changed.size ? ` · ${this.changed.size} with uncommitted changes` : "";
+    const lines = [
+      theme.fg("text", theme.bold(`Check npm packages · ${this.selected.size}/${this.packages.length} selected`)) + theme.fg("warning", changedText),
+      theme.fg("accent", theme.bold(`▸ Packages${range}`)),
+      ...visible.map((name, offset) => {
+        const index = this.listOffset + offset;
+        const isCursor = index === this.cursor;
+        const text = `${isCursor ? "→" : " "} ${this.selected.has(index) ? "[x]" : "[ ]"} ${name}`;
+        // Packages with staged, unstaged, or untracked changes are marked so they stand out.
+        const marker = this.changed.has(name) ? theme.fg("warning", " ● uncommitted changes") : "";
+        if (isCursor) return theme.fg("accent", text) + marker;
+        return (this.changed.has(name) ? theme.fg("warning", text) : theme.fg("text", text)) + marker;
+      }),
+      this.message
+        ? theme.fg("warning", this.message)
+        : theme.fg("dim", "↑↓ PgUp/PgDn move · Space toggle · Ctrl+A all · Ctrl+X none · Enter start checks · Esc cancel"),
+    ];
+    return renderPanel(lines, safeWidth, theme);
+  }
+
+  invalidate(): void {}
+}
+
+/** Let the user pick which packages to check in an overlay. Resolves undefined on cancel. */
+export async function showCheckPicker(
+  ctx: ExtensionCommandContext,
+  packages: readonly string[],
+  changed: ReadonlySet<string> = new Set(),
+): Promise<string[] | undefined> {
+  return await ctx.ui.custom<string[] | undefined>(
+    (tui, theme, _keybindings, done) => new CheckPickerOverlay(tui, theme, packages, changed, done),
+    { overlay: true, overlayOptions: PUBLISH_PICKER_OVERLAY_OPTIONS },
+  );
+}
+
 /** Let the user pick publish targets in a scrollable overlay. Resolves undefined on cancel. */
 export async function showPublishPicker<T extends PublishPickerTarget>(
   ctx: ExtensionCommandContext,

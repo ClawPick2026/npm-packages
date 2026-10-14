@@ -38,7 +38,7 @@ Planning normally prepares only the release candidates and leaves unrelated pack
 ## Commands
 
 - `/release-npm-setup` — configure and verify npm authentication.
-- `/release-npm` — find release candidates, run checks, and show a publish plan.
+- `/release-npm` — choose which packages to check, find release candidates among them, run checks, and show a publish plan.
 - `/release-toggle` (or `Ctrl+O`) — in the terminal, show or hide the progress window; in the Web UI, switch between compact and detailed progress.
 - `/release-abort` — stop the current release.
 - `/release-npm-logs` — open a saved release report.
@@ -46,13 +46,35 @@ Planning normally prepares only the release candidates and leaves unrelated pack
 ## Release flow
 
 1. The extension checks npm authentication.
-2. It compares local publishable files with the published packages to find release candidates.
-3. It prepares version changes and runs package-readiness checks.
-4. Pi shows the exact packages and versions that would be published.
-5. You choose all, selected packages, or cancel.
-6. Only the confirmed package list is published.
+2. You choose which packages to check. All packages start ticked.
+3. It compares local publishable files with the published packages to find release candidates.
+4. It prepares version changes and runs package-readiness checks.
+5. Pi shows the exact packages and versions that would be published.
+6. You choose all, selected packages, or cancel.
+7. Only the confirmed package list is published.
 
 The release output stays visible while Pi remains usable. Reports are stored under `~/.pi/agent/release-npm-logs/`.
+
+### Choosing packages to check
+
+Before any checks run, Pi lists every package in the workspace with all of them ticked. Packages you untick are left out of the checks and cannot be published in that run.
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓`, `PgUp` `PgDn`, `Home` `End` | Move the cursor |
+| `Space` | Tick or untick the package under the cursor |
+| `Ctrl+A` | Tick all packages |
+| `Ctrl+X` | Untick all packages |
+| `Enter` | Start the checks for the ticked packages |
+| `Esc` | Cancel the release |
+
+Pressing `Enter` with nothing ticked shows a reminder instead of starting.
+
+Packages with uncommitted Git changes (staged, unstaged, or new untracked files) are highlighted and marked `● uncommitted changes`, and the title counts them. The mark is only a reminder: the checks compare files on disk, so uncommitted changes are still checked and published. Outside a Git repository nothing is marked.
+
+In the Pi Web UI and other remote clients, Pi uses its standard choice prompt instead, with **Start checks**, **Select all**, **Deselect all**, one entry per package, and **Next packages** / **Previous packages** when the list needs more than one page.
+
+Checking only some packages skips version planning for the rest. If an unticked package also needs a release, for example a shared package the ticked ones depend on, it is not bumped or published in that run.
 
 ### Progress window
 
@@ -79,7 +101,7 @@ While the window is hidden, you can type in Pi and run commands. Press `Ctrl+O` 
 
 In the Pi Web UI, output is shown as a scrollable release card instead.
 
-### Choosing packages
+### Choosing packages to publish
 
 In the terminal, Pi opens a separate window with two parts that scroll on their own: the preflight summary and the package list.
 

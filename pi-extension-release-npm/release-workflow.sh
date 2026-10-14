@@ -6,6 +6,7 @@ ROOT_DIR="${PI_NPM_PACKAGES_ROOT:-$SCRIPT_DIR}"
 
 MODE=""
 TARGET="all"
+TARGETS_LIST=""
 PUBLISHER="npm"
 ACCESS="public"
 CHECK_ALT_CLIENT=0
@@ -24,6 +25,7 @@ Modes (choose exactly one):
 Options:
   --target <name|all>          Target one package directory or all (default: all)
   --all                        Same as --target all
+  --targets <dir,dir,...>      For --plan: plan only these comma-separated package directories
   --publisher <auto|bun|npm>   Publisher client (default: npm; bun is fallback when available)
   --access <public|restricted> Publish access for --publish/--plan (default: public)
   --check-alt-client           For --check: also dry-run with alternate client
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
       TARGET="all"
       shift
       ;;
+    --targets)
+      TARGETS_LIST="${2:-}"
+      shift 2
+      ;;
     --publisher)
       PUBLISHER="${2:-}"
       shift 2
@@ -110,6 +116,11 @@ fi
 
 if [[ "$ACCESS" != "public" && "$ACCESS" != "restricted" ]]; then
   echo "ERROR: --access must be public or restricted" >&2
+  exit 1
+fi
+
+if [[ -n "$TARGETS_LIST" && "$MODE" != "plan" ]]; then
+  echo "ERROR: --targets is only supported with --plan" >&2
   exit 1
 fi
 
@@ -294,7 +305,14 @@ case "$MODE" in
     workspace_root="$tmp_root/workspace"
     mkdir -p "$workspace_root"
 
-    bump_cmd=("$BUMP_SCRIPT" --target "$TARGET" --candidate-targets-file "$candidate_targets_file")
+    if [[ -n "$TARGETS_LIST" ]]; then
+      selected_targets_file="$tmp_root/selected-targets.txt"
+      tr ',' '
+' <<<"$TARGETS_LIST" > "$selected_targets_file"
+      bump_cmd=("$BUMP_SCRIPT" --targets-file "$selected_targets_file" --candidate-targets-file "$candidate_targets_file")
+    else
+      bump_cmd=("$BUMP_SCRIPT" --target "$TARGET" --candidate-targets-file "$candidate_targets_file")
+    fi
     echo "Planning required version bumps: ${bump_cmd[*]}"
     "${bump_cmd[@]}"
     echo
