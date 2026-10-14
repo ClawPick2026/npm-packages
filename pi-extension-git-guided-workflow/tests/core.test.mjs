@@ -12,6 +12,7 @@ import {
   acquireStableStagedSnapshot,
   captureBoundStagedState,
   classifyPostCommitHead,
+  countUnpushedCommits,
   discoverPushDestination,
   parseGeneratedOutput,
   parsePorcelainStatus,
@@ -159,6 +160,28 @@ test("explicit path staging and remote reads retain bounded argv contracts", asy
   assert.deepEqual(await readRemotes(root), []);
   git(root, "remote", "add", "origin", path.join(root, "unused.git"));
   assert.deepEqual(await readRemotes(root), ["origin"]);
+});
+
+test("countUnpushedCommits counts HEAD commits missing from every remote-tracking ref without fetching", async () => {
+  const unborn = await tempDir("unpushed-unborn");
+  git(unborn, "init", "-b", "main");
+  assert.equal(await countUnpushedCommits(unborn), 0);
+  const root = await repository("unpushed");
+  const bare = await tempDir("unpushed-remote.git");
+  git(bare, "init", "--bare");
+  git(root, "remote", "add", "origin", bare);
+  assert.equal(await countUnpushedCommits(root), 1);
+  git(root, "push", "origin", "main");
+  assert.equal(await countUnpushedCommits(root), 0);
+  await writeFile(path.join(root, "tracked.txt"), "second\n");
+  git(root, "commit", "-am", "test: second");
+  await writeFile(path.join(root, "tracked.txt"), "third\n");
+  git(root, "commit", "-am", "test: third");
+  assert.equal(await countUnpushedCommits(root), 2);
+  const fakeRunner = async (cwd, args) => args[0] === "rev-parse"
+    ? { exitCode: 0, timedOut: false, stdout: Buffer.from(`${"a".repeat(40)}\n`), stderr: Buffer.alloc(0) }
+    : { exitCode: 0, timedOut: false, stdout: Buffer.from("many\n"), stderr: Buffer.alloc(0) };
+  await assertCode(countUnpushedCommits(root, fakeRunner), "GIT_OUTPUT_INVALID");
 });
 
 test("package-domain fingerprint detects staged path, mode, blob, and content changes, including unborn repositories", async () => {

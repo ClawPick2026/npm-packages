@@ -1251,20 +1251,75 @@ test("Back to Stage always shows the Stage screen in a staged-only repository", 
   }
 });
 
-test("clean repository finishes with nothing to commit", async () => {
+test("clean repository without a remote continues to Push to offer publication", async () => {
   const root = await repository("stage-clean");
   const before = git(root, "rev-parse", "HEAD");
   const { commands } = extensionRegistration();
   const screens = [];
   const harness = createContext(root, {
-    actionMoves: [0],
+    actionMoves: [0, 0],
+    onScreen({ component }) { if (component.title !== undefined && component.title !== "Start Guided Git") screens.push({ title: component.title, labels: component.items?.map(({ label }) => label) }); },
+  });
+  await commands.get(COMMAND_NAME).handler("", harness.ctx);
+  assert.deepEqual(screens.map(({ title }) => title), ["No Git remote configured"]);
+  assert.deepEqual(screens[0].labels, ["Finish without publishing", "Publish a new GitHub repository"]);
+  assert.ok(harness.notifications.some(({ message }) => /Nothing to commit. No remote is configured; continuing to Push/u.test(message)));
+  assert.equal(git(root, "rev-parse", "HEAD"), before);
+});
+
+test("clean repository without commits finishes with nothing to commit", async () => {
+  const root = await tempDir("stage-clean-unborn");
+  git(root, "init", "-b", "main");
+  const { commands } = extensionRegistration();
+  const screens = [];
+  const harness = createContext(root, {
+    actionMoves: [0, 0],
     onScreen({ component }) { if (component.title !== undefined && component.title !== "Start Guided Git") screens.push({ title: component.title, detail: component.detailText }); },
   });
   await commands.get(COMMAND_NAME).handler("", harness.ctx);
-  assert.equal(screens.length, 1);
-  assert.equal(screens[0].title, "Workflow finished");
-  assert.match(screens[0].detail, /Nothing to commit/u);
-  assert.equal(git(root, "rev-parse", "HEAD"), before);
+  assert.deepEqual(screens.map(({ title }) => title), ["Workflow finished"]);
+  assert.match(screens[0].detail, /Nothing to commit. The repository has no commits yet./u);
+});
+
+test("clean repository with unpushed commits continues to Push", async (t) => {
+  for (const entry of ["stage", "message"]) {
+    await t.test(`${entry} entry`, async () => {
+      const root = await repository(`stage-clean-unpushed-${entry}`);
+      const bare = await tempDir(`stage-clean-unpushed-${entry}-remote.git`);
+      git(bare, "init", "--bare");
+      git(root, "remote", "add", "origin", bare);
+      const head = git(root, "rev-parse", "HEAD");
+      const agentDir = await installNativePreferences(`stage-clean-unpushed-${entry}`, nativePreferences({ defaultEntry: entry }));
+      const { commands } = extensionRegistration();
+      const titles = [];
+      const harness = createContext(root, {
+        actionMoves: [0, 0, 0],
+        onScreen({ component }) { if (component.title !== undefined) titles.push(component.title); },
+      });
+      await withNativeAgentDir(agentDir, () => commands.get(COMMAND_NAME).handler("", harness.ctx));
+      assert.deepEqual(titles, ["Start Guided Git", "Review push", "Workflow finished"]);
+      assert.ok(harness.notifications.some(({ message }) => /Nothing to commit\. 1 local commit is not on any remote yet; continuing to Push\./u.test(message)));
+      assert.equal(git(root, "rev-parse", "HEAD"), head, "no commit is created");
+      assert.equal(git(bare, "rev-parse", "refs/heads/main"), head);
+    });
+  }
+});
+
+test("clean repository already on its remote finishes with nothing to commit or push", async () => {
+  const root = await repository("stage-clean-pushed");
+  const bare = await tempDir("stage-clean-pushed-remote.git");
+  git(bare, "init", "--bare");
+  git(root, "remote", "add", "origin", bare);
+  git(root, "push", "origin", "main");
+  const { commands } = extensionRegistration();
+  const screens = [];
+  const harness = createContext(root, {
+    actionMoves: [0, 0],
+    onScreen({ component }) { if (component.title !== undefined && component.title !== "Start Guided Git") screens.push({ title: component.title, detail: component.detailText }); },
+  });
+  await commands.get(COMMAND_NAME).handler("", harness.ctx);
+  assert.deepEqual(screens.map(({ title }) => title), ["Workflow finished"]);
+  assert.match(screens[0].detail, /Nothing to commit or push/u);
 });
 
 test("verification ask shows the reminder on Review commit without a separate screen", async () => {

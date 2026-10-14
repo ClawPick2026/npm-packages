@@ -11,6 +11,7 @@ import {
   GuidedGitError,
   captureBoundStagedState,
   classifyPostCommitHead,
+  countUnpushedCommits,
   discoverPushDestination,
   parseGeneratedOutput,
   planPush,
@@ -345,12 +346,36 @@ function pushFailureMessage(diagnostic: string): string {
   return `Push result is uncertain: ${diagnostic}\nThe remote may have received the commit. Do not retry automatically; verify the remote externally.${authenticationHelp}`;
 }
 
+type StagedSelection = { state: RepositoryState; fingerprint: string };
+type StageResult = StagedSelection | { kind: "push"; state: RepositoryState; headOid: string } | null;
+
+/** With a clean tree, continue to Push when HEAD has commits that no remote-tracking ref contains. */
+async function nothingToCommit(ctx: ExtensionCommandContext, active: ActiveWorkflow, state: RepositoryState): Promise<StageResult> {
+  if (!state.headOid) {
+    await finishScreen(ctx, "Stage", "Nothing to commit. The repository has no commits yet.");
+    return null;
+  }
+  if ((await readRemotes(state.root)).length === 0) {
+    assertCurrent(active);
+    ctx.ui.notify("Nothing to commit. No remote is configured; continuing to Push, where you can publish or finish.", "info");
+    return { kind: "push", state, headOid: state.headOid };
+  }
+  const unpushed = await countUnpushedCommits(state.root);
+  assertCurrent(active);
+  if (unpushed > 0) {
+    ctx.ui.notify(`Nothing to commit. ${unpushed} local commit${unpushed === 1 ? " is" : "s are"} not on any remote yet; continuing to Push.`, "info");
+    return { kind: "push", state, headOid: state.headOid };
+  }
+  await finishScreen(ctx, "Stage", "Nothing to commit or push. The working tree is clean and every local commit is already on a remote.");
+  return null;
+}
+
 async function chooseStage(
   ctx: ExtensionCommandContext,
   active: ActiveWorkflow,
   preferences: GuidedGitPreferences,
   options: { showScreen?: boolean } = {},
-): Promise<{ state: RepositoryState; fingerprint: string } | null> {
+): Promise<StageResult> {
   // The Stage screen is skipped only when there is nothing to choose. Back to Stage and
   // capture failures keep it visible so a changing index cannot loop without a user boundary.
   let showScreen = options.showScreen ?? false;
@@ -358,10 +383,7 @@ async function chooseStage(
     assertCurrent(active);
     const state = await preflightRepository(ctx.cwd);
     const hasOtherChanges = state.status.unstaged + state.status.untracked > 0;
-    if (!hasOtherChanges && state.status.staged === 0) {
-      await finishScreen(ctx, "Stage", "Nothing to commit. The working tree has no staged, unstaged, or untracked changes.");
-      return null;
-    }
+    if (!hasOtherChanges && state.status.staged === 0) return await nothingToCommit(ctx, active, state);
     if (hasOtherChanges || showScreen) {
       const preserve = { value: "continue", label: "Use current staged changes", description: "Commit only what is already staged" };
       const stageAll = { value: "stage-all", label: "Stage all changes", description: "Runs git add --all" };
@@ -1226,12 +1248,22 @@ export default function gitGuidedWorkflow(pi: ExtensionAPI): void {
           await pushStage(ctx, active, entry.state, entry.state.headOid);
           return;
         }
-        let staged = entry.entry === "initialize"
-          ? await initializeRepositoryFlow(ctx, active)
-          : entry.entry === "stage"
-            ? await chooseStage(ctx, active, preferences)
-            : await stagedEntry(ctx, entry.state);
+        let staged: StageResult;
+        if (entry.entry === "initialize") staged = await initializeRepositoryFlow(ctx, active);
+        else if (entry.entry === "stage") staged = await chooseStage(ctx, active, preferences);
+        else {
+          try { staged = await stagedEntry(ctx, entry.state); }
+          catch (error) {
+            // Message and Commit entries need staged content; let Stage offer staging or continue to Push.
+            if (!isCode(error, "NOTHING_STAGED")) throw error;
+            staged = await chooseStage(ctx, active, preferences);
+          }
+        }
         while (staged) {
+          if ("kind" in staged) {
+            await pushStage(ctx, active, staged.state, staged.headOid);
+            return;
+          }
           let message: string | null;
           try { message = await chooseMessage(ctx, active, staged.state, staged.fingerprint, preferences, generation, generationUnavailableNotice); }
           catch (error) {

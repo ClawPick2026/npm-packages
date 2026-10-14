@@ -383,6 +383,15 @@ export async function readRemotes(root: string, runner: GitRunner = runGit): Pro
   return remotes;
 }
 
+/** Count commits reachable from HEAD that no remote-tracking ref contains. Reads local refs only; never fetches. */
+export async function countUnpushedCommits(root: string, runner: GitRunner = runGit): Promise<number> {
+  if (!(await readHeadOid(root, runner))) return 0;
+  const text = (await requireGit(root, ["rev-list", "--count", "HEAD", "--not", "--remotes"], runner)).toString("ascii").trim();
+  const count = Number.parseInt(text, 10);
+  if (!/^\d+$/u.test(text) || !Number.isSafeInteger(count)) throw new GuidedGitError("GIT_OUTPUT_INVALID", "Git returned an invalid unpushed-commit count");
+  return count;
+}
+
 function assertNoUnsafeControls(message: string): void {
   if (/\x1b|[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(message)) {
     throw new GuidedGitError("UNSAFE_COMMIT_MESSAGE", "Commit messages may contain newlines but no other control characters, bidirectional controls, or terminal escapes");

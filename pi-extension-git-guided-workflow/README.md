@@ -33,7 +33,7 @@ Open Pi inside the repository you want to work with. To use the guided flow, run
 In Pi's native terminal interface:
 
 1. Choose a direct entry. A directory outside Git can be initialized on `main`; an existing repository is never renamed.
-2. Keep the current index or choose **Stage all changes**, which stages everything immediately. When only staged changes exist, this step is skipped. Starter files are created and staged only when you select them.
+2. Keep the current index or choose **Stage all changes**, which stages everything immediately. When only staged changes exist, this step is skipped. When there is nothing to commit but your branch has commits that aren't on the remote yet, or no remote exists, the workflow goes straight to Push. Starter files are created and staged only when you select them.
 3. Write a message, generate candidates, explicitly reuse `dev/COMMIT/` files, or choose the one-file default when it is safe. Choosing a message goes straight to the commit review. The generated long candidate starts with the short summary, followed by `feat:`, `fix:`, and other relevant change bullets.
 4. Review the exact message and staged summary, then choose **Commit staged changes**.
 5. Review the shown destination, then choose **Continue and push** to push the exact commit. It never force-pushes and never retries automatically. When no remote exists, you may explicitly select Public or Private and publish once through system `gh`.
