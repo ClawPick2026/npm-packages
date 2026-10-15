@@ -109,6 +109,7 @@ Skills give Pi a reusable workflow for a particular kind of work. You normally a
 - **[Repo Explorer](pi-skill-repo-explorer/README.md)** — Map an unfamiliar repository and return the files, symbols, risks, and evidence needed for the next step.
 - **[Requirements engineering](pi-skill-requirements-engineering/README.md)** helps you start, update, or resume requirements work with traceable evidence, stakeholder checks, and draft working documents.
 - **[Research Orchestration](pi-skill-research-orchestration/README.md)** — Coordinate broad research across several claims, sources, and verification passes.
+- **[Rewrite in Rust](pi-skill-rust-rewrite/README.md)** — Assess and carry out Rust migrations with compatibility requirements, ownership analysis, and verification against the original.
 - **[Sailfish OS](pi-skill-sailfishos/README.md)** — Diagnose and maintain Sailfish devices with capability checks, safer package workflows, and privacy-aware diagnostics.
 - **[Server Audit](pi-skill-server-audit/README.md)** — Review a Linux server for exposed services, weak access controls, and practical hardening opportunities.
 - **[Shoo Auth](pi-skill-shoo-auth/README.md)** — Implement or troubleshoot Shoo Google sign-in in browser applications.
