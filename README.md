@@ -56,6 +56,7 @@ Extensions add commands, tools, interface elements, or automatic behavior to Pi.
 - **[Grill Me for Pi](pi-extension-grill-me/README.md)** — Turns an early idea into a focused design interview so important decisions are made before implementation.
 - **[Hyprland Wiki Local for Pi](pi-extension-hyprland-wiki-local/README.md)** — Lets Pi search a local copy of the official Hyprland Wiki first.
 - **[Image generation for Pi](pi-extension-image-generation/README.md)** lets you configure OpenRouter image defaults and privacy, choose a model, confirm the prompt, and save the image locally.
+- **[Model Research for Pi](pi-extension-model-research/README.md)** — Compare two model providers, exchange evidence-linked reviews, and create an uninstalled model-selection skill draft in Pi TUI or T3 Code.
 - **[NixOS Wiki Local for Pi](pi-extension-nixos-wiki-local/README.md)** — Lets Pi search local NixOS and Nix documentation before using the public web.
 - **[Notes for Pi](pi-extension-notes/README.md)** — Keep small local notes inside Pi and optionally use selected notes as operating rules.
 - **[Plan Executor for Pi](pi-extension-plan-executor/README.md)** — Works through a PLAN.md checklist and keeps going until the plan is complete or needs your input.
@@ -76,7 +77,7 @@ Extensions add commands, tools, interface elements, or automatic behavior to Pi.
 - **[Tools for Pi](pi-extension-tools/README.md)** — Turn Pi tools on or off from an interactive selector.
 - **[Upgrade Extensions for Pi](pi-extension-upgrade-extensions/README.md)** — Check and update npm-installed Pi extensions from inside Pi.
 - **[Wiki Tools for Pi](pi-extension-wiki-tools/README.md)** — Create and maintain local documentation-search extensions from a reusable template.
-- **[Workbook for Pi](pi-extension-workbook/README.md)** — Lets Pi inspect and carefully edit Excel workbooks with visual checks and validation.
+- **[Workbook for Pi](pi-extension-workbook/README.md)** — Lets Pi inspect and carefully edit Excel workbooks with visual checks and validation, including user-approved macro edits on Windows.
 - **[Workflows for Pi](pi-extension-workflows/README.md)** — Run saved, repeatable Pi workflows without putting all workflow logic in one large prompt.
 
 ### Skills
