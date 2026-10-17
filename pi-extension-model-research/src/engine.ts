@@ -19,6 +19,8 @@ import {
   evidenceRegister,
   modelForKey,
 } from "./prompts.ts";
+import { OVERALL_RESEARCH_TASK } from "./scope.ts";
+import { validateSubjects } from "./subjects.ts";
 import {
   ValidationError,
   parseResearchReport,
@@ -52,14 +54,16 @@ export function createRun(input: CreateRunInput): WorkflowRun {
   const targets = validateTargets(input.targets);
   const run: WorkflowRun = {
     schemaVersion: 1,
+    scope: "overall",
     runId: input.runId,
-    task: input.task,
+    task: input.task?.trim() || OVERALL_RESEARCH_TASK,
     asOfDate: input.asOfDate,
     createdAt: input.createdAt,
     updatedAt: input.createdAt,
     stage: "research",
     status: "running",
     targets: structuredClone(targets),
+    ...(input.subjects === undefined ? {} : { subjects: structuredClone(validateSubjects(input.subjects)) }),
     limits: {
       maxJobs: input.limits.maxJobs,
       perCall: { ...input.limits.perCall },
@@ -68,8 +72,8 @@ export function createRun(input: CreateRunInput): WorkflowRun {
     jobs: [],
   };
   run.jobs.push(
-    newJob(run, "research-a", "a", buildResearchPrompt(targets[0], targets, run.task, run.asOfDate)),
-    newJob(run, "research-b", "b", buildResearchPrompt(targets[1], targets, run.task, run.asOfDate)),
+    newJob(run, "research-a", "a", buildResearchPrompt(targets[0], targets, run.task, run.asOfDate, run.subjects)),
+    newJob(run, "research-b", "b", buildResearchPrompt(targets[1], targets, run.task, run.asOfDate, run.subjects)),
   );
   return validateRun(run);
 }
@@ -109,13 +113,13 @@ function markJobError(run: WorkflowRun, current: WorkflowJob, code: "invalid_out
 function parseCompletedOutput(run: WorkflowRun, current: WorkflowJob, text: string): void {
   const target = modelForKey(run.targets, current.target);
   if (current.stage === "research") {
-    const report = parseResearchReport(text, target, run.targets);
+    const report = parseResearchReport(text, target, run.targets, run.subjects);
     if (report.asOfDate !== run.asOfDate) throw new ValidationError(`research output.asOfDate: must match run asOfDate ${run.asOfDate}`);
   } else if (current.stage === "review") {
     const frozen = reports(run);
-    parseReviewReport(text, target, run.targets, { a: frozen.a.parsed, b: frozen.b.parsed });
+    parseReviewReport(text, target, run.targets, { a: frozen.a.parsed, b: frozen.b.parsed }, run.subjects);
   } else {
-    validateSkillDraft(text, run.asOfDate, run.targets);
+    validateSkillDraft(text, run.asOfDate, run.subjects ?? run.targets, run.scope === "overall", run.subjects ? run.targets : undefined);
   }
 }
 
@@ -234,8 +238,8 @@ function freezeOriginals(run: WorkflowRun): void {
   const a = job(run, "research-a");
   const b = job(run, "research-b");
   if (!a.result || !b.result) throw new Error("Research results are incomplete");
-  const parsedA = parseResearchReport(a.result, run.targets[0], run.targets);
-  const parsedB = parseResearchReport(b.result, run.targets[1], run.targets);
+  const parsedA = parseResearchReport(a.result, run.targets[0], run.targets, run.subjects);
+  const parsedB = parseResearchReport(b.result, run.targets[1], run.targets, run.subjects);
   const ids = [...parsedA.evidence, ...parsedB.evidence].map((entry) => entry.id);
   if (new Set(ids).size !== ids.length) throw new ValidationError("Evidence IDs collide across the frozen originals");
   const frozenAt = now();
@@ -247,8 +251,8 @@ function freezeOriginals(run: WorkflowRun): void {
   const originals = { a: a.result, b: b.result };
   const evidence = evidenceRegister({ a: parsedA, b: parsedB });
   run.jobs.push(
-    newJob(run, "review-a", "a", buildReviewPrompt(run.targets[0], originals, evidence)),
-    newJob(run, "review-b", "b", buildReviewPrompt(run.targets[1], originals, evidence)),
+    newJob(run, "review-a", "a", buildReviewPrompt(run.targets[0], originals, evidence, run.scope === "overall", run.subjects)),
+    newJob(run, "review-b", "b", buildReviewPrompt(run.targets[1], originals, evidence, run.scope === "overall", run.subjects)),
   );
   run.stage = "review";
   update(run, frozenAt);
@@ -262,8 +266,8 @@ function freezeReviews(run: WorkflowRun): void {
   const frozenAt = now();
   run.reviews = {
     frozenAt,
-    a: { raw: a.result, parsed: parseReviewReport(a.result, run.targets[0], run.targets, { a: originals.a.parsed, b: originals.b.parsed }) },
-    b: { raw: b.result, parsed: parseReviewReport(b.result, run.targets[1], run.targets, { a: originals.a.parsed, b: originals.b.parsed }) },
+    a: { raw: a.result, parsed: parseReviewReport(a.result, run.targets[0], run.targets, { a: originals.a.parsed, b: originals.b.parsed }, run.subjects) },
+    b: { raw: b.result, parsed: parseReviewReport(b.result, run.targets[1], run.targets, { a: originals.a.parsed, b: originals.b.parsed }, run.subjects) },
   };
   run.stage = "writer_selection";
   update(run, frozenAt);
@@ -277,6 +281,7 @@ function qualifyingEvidence(evidence: ResearchEvidence, target: ModelKey): boole
 }
 
 export function automaticWriterSelection(run: WorkflowRun): WriterSelection | undefined {
+  if (run.subjects !== undefined) return undefined;
   if (!run.originals || !run.reviews) return undefined;
   const reviewA = run.reviews.a.parsed;
   const reviewB = run.reviews.b.parsed;
@@ -316,6 +321,8 @@ function addDraftJob(run: WorkflowRun): void {
     run.writerSelection,
     run.task,
     run.asOfDate,
+    run.scope === "overall",
+    run.subjects,
   );
   run.jobs.push(newJob(run, "draft", target.key, prompt));
   run.stage = "draft";
@@ -326,7 +333,7 @@ function addDraftJob(run: WorkflowRun): void {
 export function chooseWriter(
   run: WorkflowRun,
   target: ModelKey,
-  rationale = "Explicit user choice after reciprocal reviews were inconclusive.",
+  rationale = run.subjects ? "Explicit user choice of a configured research worker; evidence about the comparison subjects cannot select the writer." : "Explicit user choice after reciprocal reviews were inconclusive.",
   selectedAt = now(),
 ): WorkflowRun {
   validateRun(run);
@@ -480,7 +487,7 @@ export async function advanceRun(
 
     if (run.stage === "draft") {
       const draft = job(run, "draft");
-      run.skillDraft = validateSkillDraft(draft.result!, run.asOfDate, run.targets);
+      run.skillDraft = validateSkillDraft(draft.result!, run.asOfDate, run.subjects ?? run.targets, run.scope === "overall", run.subjects ? run.targets : undefined);
       run.stage = "complete";
       run.status = "complete";
       run.completedAt = now();

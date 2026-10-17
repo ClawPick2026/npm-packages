@@ -10,15 +10,18 @@ import { fetchPublicPage, PublicFetchError } from "./src/public-fetch.ts";
 import { createRunStore, type RunEnvelope, type RunStore } from "./src/storage.ts";
 import { createT3Runtime, listT3CatalogTargets, loadT3Catalog, type T3Catalog } from "./src/t3-runtime.ts";
 import { createInjectedToolBridge, discoverT3Tools, normalizeToolName, type HostTool } from "./src/tool-bridge.ts";
+import { studyScope } from "./src/scope.ts";
+import { comparisonSubjects, normalizeSubjects } from "./src/subjects.ts";
 import { validateTargets } from "./src/validation.ts";
-import type { ModelKey, ModelTarget, Runtime, Usage, WorkflowRun } from "./src/types.ts";
+import type { ComparisonSubjects, ModelKey, ModelTarget, Runtime, Usage, WorkflowRun } from "./src/types.ts";
 
 const Actions = ["start", "models", "list", "status", "continue", "writer", "cancel", "export"] as const;
 const Parameters = Type.Object({
   action: Type.Union(Actions.map(value => Type.Literal(value))),
   runId: Type.Optional(Type.String({ maxLength: 120 })),
-  task: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
+  task: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000, description: "Optional additional priorities. Every study compares the models overall across all major task families; this cannot narrow its scope." })),
   offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
+  subjects: Type.Optional(Type.Array(Type.String({ maxLength: 20_000 }), { minItems: 2, maxItems: 2, description: "Two comparison model labels, even if unconfigured. Trimmed single-line names, 1–200 characters each, distinct ignoring case. These never select execution workers." })),
   targets: Type.Optional(Type.Array(Type.Object({
     hostingProvider: Type.String(),
     model: Type.String(),
@@ -33,7 +36,7 @@ const Parameters = Type.Object({
 });
 
 type Selection = { hostingProvider: string; model: string; modelAuthor?: string; settings?: ModelTarget["settings"] };
-type Request = { action: typeof Actions[number]; runId?: string; task?: string; offset?: number; targets?: Selection[]; writer?: ModelKey; confirmed?: boolean; maxTokens?: number; maxTurns?: number; timeoutMs?: number };
+type Request = { action: typeof Actions[number]; runId?: string; task?: string; offset?: number; targets?: Selection[]; subjects?: [string, string]; writer?: ModelKey; confirmed?: boolean; maxTokens?: number; maxTurns?: number; timeoutMs?: number };
 type Choice = Selection & { displayName: string; transport: string };
 type Host = { kind: "pi" | "t3"; owner: string; choices: Choice[]; catalog?: T3Catalog };
 type Marker = { runId: string; owner: string; projectRoot: string; runtimeKind: "pi" | "t3"; status: string; taskIds: string[] };
@@ -105,7 +108,19 @@ async function inspectHost(ctx: ExtensionToolContext, env: NodeJS.ProcessEnv, si
   return { kind: "pi", owner: ctx.sessionManager.getSessionId(), choices };
 }
 
+async function selectSubjects(ctx: ExtensionToolContext, request: Request): Promise<ComparisonSubjects | undefined> {
+  if (request.subjects !== undefined) return normalizeSubjects(request.subjects);
+  // Explicit programmatic workers retain the legacy subjects-as-workers contract.
+  if (request.targets !== undefined || !ctx.hasUI) return undefined;
+  const a = await ctx.ui.input("Comparison subject A", "Any model name or ID, including an unconfigured model");
+  if (a === undefined) throw new Error("Comparison subject input cancelled before model dispatch");
+  const b = await ctx.ui.input("Comparison subject B", "A different model name or ID; research workers are selected next");
+  if (b === undefined) throw new Error("Comparison subject input cancelled before model dispatch");
+  return normalizeSubjects([a, b]);
+}
+
 async function selectTargets(ctx: ExtensionToolContext, host: Host, supplied?: Selection[]): Promise<[ModelTarget, ModelTarget]> {
+  if (supplied !== undefined && supplied.length !== 2) throw new Error("Two explicit worker targets are required");
   const chosen: ModelTarget[] = [];
   for (const [index, key] of (["a", "b"] as const).entries()) {
     let selection = supplied?.[index];
@@ -113,7 +128,7 @@ async function selectTargets(ctx: ExtensionToolContext, host: Host, supplied?: S
       if (!ctx.hasUI) throw new Error("Noninteractive starts require two explicit targets; use action=models to inspect available identities");
       const choices = host.choices.filter(choice => !chosen.some(old => old.hostingProvider === choice.hostingProvider && old.model === choice.model));
       const labels = choices.map((choice, i) => `${i + 1}. ${safeUi(choice.displayName)}`);
-      const picked = await ctx.ui.select(`Research model ${key.toUpperCase()} (${host.kind})`, labels);
+      const picked = await ctx.ui.select(`Research worker ${key.toUpperCase()} (${host.kind})`, labels);
       if (!picked) throw new Error("Model selection cancelled");
       selection = choices[labels.indexOf(picked)];
     }
@@ -146,7 +161,7 @@ async function storageFor(ctx: ExtensionToolContext, host: Host, root: string): 
 
 function summary(run: WorkflowRun) {
   const cancellationPending = run.status === "cancelled" && run.jobs.some(job => job.status !== "complete" && !job.cancellationAcknowledgedAt);
-  return { cancellationPending, runId: run.runId, status: run.status, stage: run.stage, models: run.targets, jobs: run.jobs.map(job => ({ key: job.key, status: job.status, taskId: job.taskId, usage: job.usage, error: job.error, statusError: job.statusError, cancellationAcknowledgedAt: job.cancellationAcknowledgedAt, cancellationError: job.cancellationError })), writer: run.writerSelection, error: run.error, cancellationErrors: run.cancellationErrors };
+  return { cancellationPending, runId: run.runId, status: run.status, stage: run.stage, subjects: comparisonSubjects(run), workers: run.targets, models: run.targets, jobs: run.jobs.map(job => ({ key: job.key, status: job.status, taskId: job.taskId, usage: job.usage, error: job.error, statusError: job.statusError, cancellationAcknowledgedAt: job.cancellationAcknowledgedAt, cancellationError: job.cancellationError })), writer: run.writerSelection, error: run.error, cancellationErrors: run.cancellationErrors };
 }
 
 function remember(pi: ExtensionAPI, record: RunEnvelope): void {
@@ -172,7 +187,7 @@ function commandRequest(text: string): Request {
   if (!trimmed) return { action: "start" };
   const [action, runId, writer, ...extra] = trimmed.split(/\s+/);
   if (action === "start") return { action, task: trimmed.slice(5).trim() || undefined };
-  if (!(Actions as readonly string[]).includes(action!)) throw new Error("Use /model-research [start <task>|models|list|status <id>|continue <id>|writer <id> [a|b]|cancel <id>|export <id>]");
+  if (!(Actions as readonly string[]).includes(action!)) throw new Error("Use /model-research [start [additional context]|models|list|status <id>|continue <id>|writer <id> [a|b]|cancel <id>|export <id>]");
   if (extra.length || (writer && action !== "writer") || (writer && writer !== "a" && writer !== "b")) throw new Error("Unexpected model-research arguments");
   if ((action === "list" || action === "models") && runId) throw new Error(`${action} takes no run ID`);
   return { action: action as Request["action"], runId, writer: writer as ModelKey | undefined };
@@ -202,7 +217,7 @@ export function createModelResearchExtension(options: { stateRoot?: string; env?
       },
     });
     pi.registerCommand("model-research", {
-      description: "Compare two model providers, exchange reviews, and draft an evidence-linked routing skill",
+      description: "Compare any two model names using configured workers and draft task-by-task model-usage guidance",
       handler: async (args, ctx) => {
         try {
           const request = commandRequest(args);
@@ -227,7 +242,7 @@ export function createModelResearchExtension(options: { stateRoot?: string; env?
     pi.registerTool({
       name: "model_research",
       label: "Model research",
-      description: "Run the separate two-provider model-research → reciprocal-review → skill-draft workflow. Use models to inspect identities, start for native setup/consent, continue once after T3 child completion, status/list without advancing, writer for an explicit inconclusive writer choice, cancel, or export. Never poll pending T3 tasks or repeat failed/uncertain jobs. Skills remain uninstalled drafts. Headless starts need explicit targets/task and user authorization via confirmed=true.",
+      description: "Run the separate two-worker model-research → reciprocal-review → skill-draft workflow. Use models to inspect identities, start to enter any two comparison subject labels, select configured research workers, and give native consent, continue once after T3 child completion, status/list without advancing, writer for an explicit research-worker writer choice, cancel, or export. Never poll pending T3 tasks or repeat failed/uncertain jobs. Every study covers overall model usage and ends with task-by-task choices; do not ask the user to define a task scope. Skills remain uninstalled drafts. Headless starts need explicit targets and user authorization via confirmed=true.",
       parameters: Parameters,
       exposure: "model-only",
       executionMode: "sequential",
@@ -262,15 +277,14 @@ export function createModelResearchExtension(options: { stateRoot?: string; env?
             return { content: [{ type: "text", text: JSON.stringify(runs.map(item => summary(item.run)), null, 2) }], details: { count: runs.length } };
           }
           if (request.action === "start") {
-            const task = request.task ?? (ctx.hasUI ? await ctx.ui.input("What model-usage decisions should this study cover?", "For example coding, research, planning, and writing Pi skills") : undefined);
-            if (!task?.trim()) throw new Error("A non-empty research task is required");
+            const subjects = await selectSubjects(ctx, request);
             const targets = await selectTargets(ctx, host, request.targets);
             const now = new Date().toISOString();
-            const run = createRun({ runId: `study-${randomUUID()}`, task: task.trim(), asOfDate: now.slice(0, 10), createdAt: now, targets, limits: { maxJobs: 5, perCall: { timeoutMs: request.timeoutMs ?? 600_000, maxTurns: request.maxTurns ?? 10, maxTokens: request.maxTokens ?? 80_000 }, expiresAt: new Date(Date.now() + 86_400_000).toISOString() } });
+            const run = createRun({ runId: `study-${randomUUID()}`, task: request.task, asOfDate: now.slice(0, 10), createdAt: now, targets, ...(subjects ? { subjects } : {}), limits: { maxJobs: 5, perCall: { timeoutMs: request.timeoutMs ?? 600_000, maxTurns: request.maxTurns ?? 10, maxTokens: request.maxTokens ?? 80_000 }, expiresAt: new Date(Date.now() + 86_400_000).toISOString() } });
             const runtime = runtimeFor(ctx, host, targets);
             for (const job of run.jobs) await runtime.preflight(job, operationSignal);
             const warning = host.kind === "t3" ? "T3 children use approval-required mode, but inherited tools are NOT sandboxed. Token/turn/USD limits cannot be enforced by this adapter; expiry is checked only on continuation/cancel." : "Pi calls expose only existing read-only search/fetch tools. Token accounting uses provider-reported input/output/cache counts and may overshoot by one response; this is not a hard USD cap.";
-            const consent = `Run ID: ${run.runId}\nResearch A: ${safeUi(targets[0].displayName, 4_000)}\nResearch B: ${safeUi(targets[1].displayName, 4_000)}\nTask: ${safeUi(task, 20_000)}\nUp to 5 model jobs; limits per call: ${run.limits.perCall.maxTokens} cumulative reported tokens across all turns (including repeated input/cache), ${run.limits.perCall.maxTurns} turns, ${run.limits.perCall.timeoutMs / 1000}s.\nSettings: ${JSON.stringify(targets.map(target => target.settings))}\n${warning}\nBoth providers receive the task, public web queries, and eventually both reports/reviews. No private conversation history is copied. Don't include secrets.\nDraft storage: ${store.root}\nNo installation, automatic switching, or source-access circumvention. Proceed?`;
+            const consent = `Run ID: ${run.runId}\nCompared subjects (unverified labels):\n${comparisonSubjects(run).map(subject => `${subject.key.toUpperCase()}: ${JSON.stringify(subject.model)}`).join("\n")}\nResearch workers (execution only):\n${targets.map(target => `${target.key.toUpperCase()}: ${safeUi(target.displayName, Infinity)} (author: ${safeUi(target.modelAuthor, Infinity)})`).join("\n")}\nStudy scope: ${safeUi(studyScope(run.task), Infinity)}\nUp to 5 model jobs; limits per call: ${run.limits.perCall.maxTokens} cumulative reported tokens across all turns (including repeated input/cache), ${run.limits.perCall.maxTurns} turns, ${run.limits.perCall.timeoutMs / 1000}s.\nSettings: ${JSON.stringify(targets.map(target => target.settings))}\n${warning}\nBoth providers receive the comparison subjects, task, public web queries, and eventually both reports/reviews. No private conversation history is copied. Don't include secrets.\nDraft storage: ${store.root}\nNo installation, automatic switching, or source-access circumvention. Proceed?`;
             const approved = ctx.hasUI ? await ctx.ui.confirm("Start model research?", consent) : request.confirmed === true;
             if (!approved) return { content: [{ type: "text", text: "Model research cancelled before model dispatch." }], details: { status: "declined" } };
             record = await store.create(run);
@@ -299,10 +313,10 @@ export function createModelResearchExtension(options: { stateRoot?: string; env?
                 if (record.run.status !== "awaiting_writer") throw new Error("This run is not awaiting a writer choice");
                 let writer = request.writer;
                 if (!writer && ctx.hasUI) {
-                  const labels = record.run.targets.map(target => `${target.key}: ${safeUi(target.displayName)}`);
-                  const selected = await ctx.ui.select("Evidence was inconclusive: choose a skill writer explicitly", labels);
+                  const labels = record.run.targets.map(target => `${target.key}: research worker ${safeUi(target.displayName, Infinity)}`);
+                  const selected = await ctx.ui.select(record.run.subjects ? "Choose a research worker to write the skill; evidence about compared subjects cannot select a worker" : "Evidence was inconclusive: choose a research worker to write the skill", labels);
                   if (selected) writer = record.run.targets[labels.indexOf(selected)]?.key;
-                } else if (writer && ctx.hasUI && !await ctx.ui.confirm("Choose skill writer?", `Run ${runId}: use target ${writer} by explicit user choice, not as an evidence-proven winner?`)) writer = undefined;
+                } else if (writer && ctx.hasUI && !await ctx.ui.confirm("Choose skill writer?", `Run ${runId}: choose research worker ${writer} (${safeUi(record.run.targets.find(target => target.key === writer)?.displayName ?? "unknown", Infinity)}) to write the skill by explicit user choice? This does not choose a comparison winner. Compared subjects: ${JSON.stringify(comparisonSubjects(record.run))}`)) writer = undefined;
                 if (!writer || (!ctx.hasUI && request.confirmed !== true)) throw new Error("An explicit authorized writer choice is required");
                 chooseWriter(record.run, writer);
                 await save(record.run);

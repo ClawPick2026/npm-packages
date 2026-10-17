@@ -18,6 +18,9 @@ export const FIXED_REFERENCE_PATHS = [
 ] as const;
 
 export type ModelKey = (typeof MODEL_KEYS)[number];
+/** Unverified comparison labels, never execution targets or capability claims. */
+export type ComparisonSubject = { readonly key: ModelKey; readonly model: string };
+export type ComparisonSubjects = readonly [ComparisonSubject, ComparisonSubject];
 export type JobKey = (typeof JOB_KEYS)[number];
 export type WorkflowStage = "research" | "review" | "writer_selection" | "draft" | "complete";
 export type RunStatus = "running" | "awaiting_writer" | "error" | "cancelled" | "complete";
@@ -104,6 +107,7 @@ export type ResearchEvidence = {
   sourceAccess: SourceAccess;
   evidenceClass: EvidenceClass;
   topics: EvidenceTopic[];
+  /** Comparison subject key; this is not a worker capability assertion. */
   supportsTarget: ModelKey | "neither";
   title: string;
   excerptOrGap: string;
@@ -138,6 +142,8 @@ export type SocialCoverage = {
 export type ResearchReport = {
   schemaVersion: 1;
   researcher: ModelTarget;
+  /** Required by validation only when the run has explicit comparison subjects. */
+  subjects?: ComparisonSubjects;
   subjectTargets: [ModelKey, ModelKey];
   asOfDate: string;
   taskSpecificRecommendation: string;
@@ -205,6 +211,7 @@ export type RunError = {
 
 export type WorkflowRun = {
   schemaVersion: 1;
+  scope?: "overall";
   runId: string;
   task: string;
   asOfDate: string;
@@ -213,6 +220,8 @@ export type WorkflowRun = {
   stage: WorkflowStage;
   status: RunStatus;
   targets: [ModelTarget, ModelTarget];
+  /** Canonical comparison data, immutable across saved checkpoints. */
+  subjects?: ComparisonSubjects;
   limits: RunLimits;
   jobs: WorkflowJob[];
   originals?: {
@@ -236,10 +245,12 @@ export type WorkflowRun = {
 
 export type CreateRunInput = {
   runId: string;
-  task: string;
+  task?: string;
   asOfDate: string;
   createdAt: string;
   targets: [ModelTarget, ModelTarget];
+  /** Normalize UI/tool strings with normalizeSubjects before creating a run. */
+  subjects?: ComparisonSubjects;
   limits: RunLimits;
 };
 

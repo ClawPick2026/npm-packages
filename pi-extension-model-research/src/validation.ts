@@ -6,6 +6,7 @@ import {
   MODEL_KEYS,
   RECIPROCAL_REVIEW_RUBRIC,
   type ArgumentRow,
+  type ComparisonSubjects,
   type ModelKey,
   type ModelTarget,
   type ResearchEvidence,
@@ -16,6 +17,9 @@ import {
   type WorkflowJob,
   type WorkflowRun,
 } from "./types.ts";
+
+import { INCONCLUSIVE_MODEL_CHOICES, MODEL_USAGE_TASKS, USAGE_SUMMARY_HEADER, USAGE_SUMMARY_HEADING } from "./scope.ts";
+import { escapeSubjectLabel, subjectChoiceLabels, validateSubjects } from "./subjects.ts";
 
 const MAX_RUN_BYTES = 4_000_000;
 const MAX_RAW_OUTPUT = 500_000;
@@ -35,6 +39,11 @@ export class ValidationError extends Error {
 
 function fail(path: string, message: string): never {
   throw new ValidationError(`${path}: ${message}`);
+}
+
+function subjectTuple(value: unknown, path: string): ComparisonSubjects {
+  try { return validateSubjects(value); }
+  catch (error) { fail(path, error instanceof Error ? error.message : String(error)); }
 }
 
 function record(value: unknown, path: string): Record<string, unknown> {
@@ -237,9 +246,16 @@ function validateCoverageEntry(value: unknown, path: string, validEvidence: Set<
   }
 }
 
-function validateResearchReportValue(value: unknown, expectedResearcher: ModelTarget, targets: [ModelTarget, ModelTarget], path: string): ResearchReport {
+function validateResearchReportValue(value: unknown, expectedResearcher: ModelTarget, targets: [ModelTarget, ModelTarget], path: string, expectedSubjects?: ComparisonSubjects): ResearchReport {
   const report = record(value, path);
-  exactKeys(report, ["schemaVersion", "researcher", "subjectTargets", "asOfDate", "taskSpecificRecommendation", "arguments", "evidence", "counterevidenceAndConditions", "confidence", "socialCoverage", "accessGaps"], [], path);
+  exactKeys(report, ["schemaVersion", "researcher", "subjectTargets", "asOfDate", "taskSpecificRecommendation", "arguments", "evidence", "counterevidenceAndConditions", "confidence", "socialCoverage", "accessGaps", ...(expectedSubjects ? ["subjects"] : [])], [], path);
+  if (expectedSubjects) {
+    subjectTuple(expectedSubjects, "expected subjects");
+    const actualSubjects = subjectTuple(report.subjects, `${path}.subjects`);
+    if (actualSubjects.some((subject, index) => subject.key !== expectedSubjects[index].key || subject.model !== expectedSubjects[index].model)) {
+      fail(`${path}.subjects`, "must exactly match the run comparison subjects");
+    }
+  }
   if (report.schemaVersion !== 1) fail(`${path}.schemaVersion`, "must equal 1");
   const researcher = validateModelTarget(report.researcher, `${path}.researcher`);
   if (!sameTarget(researcher, expectedResearcher)) fail(`${path}.researcher`, "must exactly match the selected target");
@@ -272,7 +288,7 @@ function validateResearchReportValue(value: unknown, expectedResearcher: ModelTa
   return report as ResearchReport;
 }
 
-export function parseResearchReport(raw: string, expectedResearcher: ModelTarget, targets: [ModelTarget, ModelTarget]): ResearchReport {
+export function parseResearchReport(raw: string, expectedResearcher: ModelTarget, targets: [ModelTarget, ModelTarget], subjects?: ComparisonSubjects): ResearchReport {
   stringValue(raw, "research output", MAX_RESEARCH_CHARS);
   let value: unknown;
   try {
@@ -280,7 +296,7 @@ export function parseResearchReport(raw: string, expectedResearcher: ModelTarget
   } catch (error) {
     fail("research output", `invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return validateResearchReportValue(value, expectedResearcher, targets, "research output");
+  return validateResearchReportValue(value, expectedResearcher, targets, "research output", subjects);
 }
 
 function validateReviewReportValue(
@@ -289,6 +305,7 @@ function validateReviewReportValue(
   targets: [ModelTarget, ModelTarget],
   reports: { a: ResearchReport; b: ResearchReport },
   path: string,
+  subjects?: ComparisonSubjects,
 ): ReviewReport {
   const review = record(value, path);
   exactKeys(review, ["schemaVersion", "reviewer", "reviewedOriginals", "rubric", "usefulnessVsOwn", "corrections", "disagreements", "missingEvidence", "writerRecommendation", "writerEvidenceIds", "confidence"], [], path);
@@ -331,6 +348,7 @@ function validateReviewReportValue(
   }
   stringList(review.missingEvidence, `${path}.missingEvidence`, 0, 50);
   const recommendation = enumValue(review.writerRecommendation, ["a", "b", "undetermined"] as const, `${path}.writerRecommendation`);
+  if (subjects && recommendation !== "undetermined") fail(`${path}.writerRecommendation`, "must be undetermined when comparing explicit subjects; subject evidence cannot select a research worker");
   const writerEvidenceIds = stringList(review.writerEvidenceIds, `${path}.writerEvidenceIds`, recommendation === "undetermined" ? 0 : 1, 50);
   if (recommendation === "undetermined" && writerEvidenceIds.length > 0) fail(`${path}.writerEvidenceIds`, "must be empty for an undetermined recommendation");
   for (const id of writerEvidenceIds) if (!evidenceIds.has(id)) fail(`${path}.writerEvidenceIds`, `references unknown evidence ${id}`);
@@ -343,6 +361,7 @@ export function parseReviewReport(
   expectedReviewer: ModelTarget,
   targets: [ModelTarget, ModelTarget],
   reports: { a: ResearchReport; b: ResearchReport },
+  subjects?: ComparisonSubjects,
 ): ReviewReport {
   stringValue(raw, "review output", MAX_REVIEW_CHARS);
   let value: unknown;
@@ -351,10 +370,70 @@ export function parseReviewReport(
   } catch (error) {
     fail("review output", `invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return validateReviewReportValue(value, expectedReviewer, targets, reports, "review output");
+  return validateReviewReportValue(value, expectedReviewer, targets, reports, "review output", subjects);
 }
 
-export function validateSkillDraft(raw: string, asOfDate: string, targets?: [ModelTarget, ModelTarget]): string {
+export function usageSummarySection(raw: string): string {
+  const marker = `\n${USAGE_SUMMARY_HEADING}\n`;
+  const start = raw.indexOf(marker);
+  if (start < 0 || raw.indexOf(marker, start + marker.length) >= 0) fail("skill draft", `must contain exactly one final ${USAGE_SUMMARY_HEADING} section`);
+  return raw.slice(start + 1).trimEnd() + "\n";
+}
+
+function validateUsageSummary(raw: string, targets?: ComparisonSubjects | [ModelTarget, ModelTarget], subjects?: ComparisonSubjects): void {
+  const lines = usageSummarySection(raw).split("\n").slice(1).filter(line => line.trim());
+  if (lines.length !== MODEL_USAGE_TASKS.length + 2) fail("skill draft usage summary", "must end with only a table covering every task family exactly once");
+  const cells = (line: string): string[] => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) fail("skill draft usage summary", "must use pipe-delimited table rows");
+    const result: string[] = [];
+    let cell = "";
+    const content = trimmed.slice(1, -1);
+    for (let index = 0; index < content.length; index += 1) {
+      const char = content[index];
+      if (char === "\\" && content[index + 1] !== undefined) cell += char + content[++index];
+      else if (char === "|") { result.push(cell.trim()); cell = ""; }
+      else cell += char;
+    }
+    result.push(cell.trim());
+    return result;
+  };
+  if (JSON.stringify(cells(lines[0])) !== JSON.stringify(cells(USAGE_SUMMARY_HEADER))) fail("skill draft usage summary", "must use the required table columns");
+  const divider = cells(lines[1]);
+  if (divider.length !== 5 || divider.some(cell => !/^:?-{3,}:?$/.test(cell))) fail("skill draft usage summary", "must include a valid table separator");
+  const remaining = new Set<string>(MODEL_USAGE_TASKS);
+  const choices = new Set<string>([...INCONCLUSIVE_MODEL_CHOICES, ...(subjects ? subjectChoiceLabels(subjects) : (targets ?? []).flatMap(target => [target.model, escapeSubjectLabel(target.model), target.model.replace(/\|/g, "\\|")]))]);
+  for (const line of lines.slice(2)) {
+    const row = cells(line);
+    if (row.length !== 5 || row.some(cell => !cell)) fail("skill draft usage summary", "must provide five nonempty cells per task family");
+    if (!remaining.delete(row[0])) fail("skill draft usage summary", `unknown or duplicate task family ${row[0]}`);
+    if (targets && !choices.has(row[1])) fail("skill draft usage summary", `Use must name an exact compared model or ${INCONCLUSIVE_MODEL_CHOICES.join(", ")}`);
+    if (!/^(?:100|[1-9]?\d)\/100$/.test(row[4])) fail("skill draft usage summary", "confidence must be an integer from 0 through 100 formatted as N/100");
+  }
+}
+
+function containsModelLabel(text: string, label: string): boolean {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\p{L}\\p{N}._-])${escaped}(?=$|[^\\p{L}\\p{N}._-]|\\.(?![\\p{L}\\p{N}_-]))`, "u").test(text);
+}
+
+function validateSubjectRouting(body: string, subjects: ComparisonSubjects, workers: [ModelTarget, ModelTarget], requireUsageSummary: boolean): void {
+  const heading = /(?:^|\n)## Routing guidance[ \t]*\n/.exec(body);
+  if (!heading) fail("skill draft", "must have a Routing guidance section");
+  const rest = body.slice(heading.index + heading[0].length);
+  const end = rest.search(/^## /m);
+  let routing = (end < 0 ? rest : rest.slice(0, end)) + (requireUsageSummary ? usageSummarySection(body) : "");
+  routing = routing.toLocaleLowerCase("en-US");
+  const labels = subjects.flatMap(subject => [subject.model, escapeSubjectLabel(subject.model)]).sort((a, b) => b.length - a.length);
+  for (const label of labels) routing = routing.split(label.toLocaleLowerCase("en-US")).join(" ");
+  for (const worker of workers) {
+    if ([worker.model, escapeSubjectLabel(worker.model)].some(label => containsModelLabel(routing, label.toLocaleLowerCase("en-US")))) {
+      fail("skill draft routing guidance", `must not reference research worker ${worker.model} instead of comparison subjects`);
+    }
+  }
+}
+
+export function validateSkillDraft(raw: string, asOfDate: string, targets?: ComparisonSubjects | [ModelTarget, ModelTarget], requireUsageSummary = false, workers?: [ModelTarget, ModelTarget]): string {
   stringValue(raw, "skill draft", 300_000);
   if (raw.startsWith("```")) fail("skill draft", "must not be wrapped in a code fence");
   const match = raw.match(/^---\n([\s\S]*?)\n---\n/);
@@ -383,7 +462,11 @@ export function validateSkillDraft(raw: string, asOfDate: string, targets?: [Mod
     if (!body.includes(heading)) fail("skill draft", `missing required heading ${heading}`);
   }
   if (!body.includes(asOfDate)) fail("skill draft", `must state evidence as-of date ${asOfDate}`);
-  for (const target of targets ?? []) if (!body.includes(target.model)) fail("skill draft", `must identify exact model ${target.model}`);
+  const subjects = targets && !("hostingProvider" in targets[0]) ? subjectTuple(targets, "skill draft subjects") : undefined;
+  for (const target of targets ?? []) {
+    const identified = subjects ? containsModelLabel(body, escapeSubjectLabel(target.model)) : body.includes(target.model) || body.includes(escapeSubjectLabel(target.model));
+    if (!identified) fail("skill draft", `must identify exact model ${target.model}`);
+  }
   for (const path of FIXED_REFERENCE_PATHS) {
     if (!body.includes(`](${path})`)) fail("skill draft", `missing fixed reference link ${path}`);
   }
@@ -391,6 +474,8 @@ export function validateSkillDraft(raw: string, asOfDate: string, targets?: [Mod
     if (!(FIXED_REFERENCE_PATHS as readonly string[]).includes(match[1])) fail("skill draft", `unsupported link destination ${match[1]}`);
   }
   if (/^\s*\[[^\]]+\]:/m.test(body) || /<(?:a|img|script|iframe|link|object)\b/i.test(body)) fail("skill draft", "reference-style links and active HTML are unsupported");
+  if (requireUsageSummary) validateUsageSummary(body, targets, subjects);
+  if (subjects && workers) validateSubjectRouting(body, subjects, workers, requireUsageSummary);
   return raw;
 }
 
@@ -432,8 +517,9 @@ export function validateRun(value: unknown): WorkflowRun {
   }
   if (serialized === undefined || serialized.length > MAX_RUN_BYTES) fail("run", `serialized form must be at most ${MAX_RUN_BYTES} bytes`);
   const run = record(value, "run");
-  exactKeys(run, ["schemaVersion", "runId", "task", "asOfDate", "createdAt", "updatedAt", "stage", "status", "targets", "limits", "jobs"], ["originals", "reviews", "writerSelection", "skillDraft", "error", "cancellationReason", "cancellationErrors", "cancelledAt", "completedAt"], "run");
+  exactKeys(run, ["schemaVersion", "runId", "task", "asOfDate", "createdAt", "updatedAt", "stage", "status", "targets", "limits", "jobs"], ["scope", "subjects", "originals", "reviews", "writerSelection", "skillDraft", "error", "cancellationReason", "cancellationErrors", "cancelledAt", "completedAt"], "run");
   if (run.schemaVersion !== 1) fail("run.schemaVersion", "must equal 1");
+  if (run.scope !== undefined) enumValue(run.scope, ["overall"] as const, "run.scope");
   const runId = stringValue(run.runId, "run.runId", 120);
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(runId)) fail("run.runId", "must be a stable portable identifier");
   stringValue(run.task, "run.task", MAX_LONG);
@@ -443,6 +529,7 @@ export function validateRun(value: unknown): WorkflowRun {
   enumValue(run.stage, ["research", "review", "writer_selection", "draft", "complete"] as const, "run.stage");
   const status = enumValue(run.status, ["running", "awaiting_writer", "error", "cancelled", "complete"] as const, "run.status");
   const targets = validateTargets(run.targets);
+  const subjects = run.subjects === undefined ? undefined : subjectTuple(run.subjects, "run.subjects");
   const limits = validateLimits(run.limits);
   if (Date.parse(limits.expiresAt) <= Date.parse(run.createdAt as string)) fail("run.limits.expiresAt", "must be later than createdAt");
 
@@ -461,7 +548,7 @@ export function validateRun(value: unknown): WorkflowRun {
       const item = record(originals[key], `run.originals.${key}`);
       exactKeys(item, ["raw", "parsed"], [], `run.originals.${key}`);
       const raw = stringValue(item.raw, `run.originals.${key}.raw`, MAX_RESEARCH_CHARS);
-      const parsed = validateResearchReportValue(item.parsed, targets[key === "a" ? 0 : 1], targets, `run.originals.${key}.parsed`);
+      const parsed = validateResearchReportValue(item.parsed, targets[key === "a" ? 0 : 1], targets, `run.originals.${key}.parsed`, subjects);
       if (JSON.stringify(JSON.parse(raw)) !== JSON.stringify(parsed)) fail(`run.originals.${key}`, "parsed data must match the frozen raw output");
       if (parsed.asOfDate !== run.asOfDate) fail(`run.originals.${key}.parsed.asOfDate`, "must match run asOfDate");
       const job = jobs.find((candidate) => candidate.key === `research-${key}`);
@@ -483,7 +570,7 @@ export function validateRun(value: unknown): WorkflowRun {
       const item = record(reviews[key], `run.reviews.${key}`);
       exactKeys(item, ["raw", "parsed"], [], `run.reviews.${key}`);
       const raw = stringValue(item.raw, `run.reviews.${key}.raw`, MAX_REVIEW_CHARS);
-      validateReviewReportValue(item.parsed, targets[key === "a" ? 0 : 1], targets, reports!, `run.reviews.${key}.parsed`);
+      validateReviewReportValue(item.parsed, targets[key === "a" ? 0 : 1], targets, reports!, `run.reviews.${key}.parsed`, subjects);
       if (JSON.stringify(JSON.parse(raw)) !== JSON.stringify(item.parsed)) fail(`run.reviews.${key}`, "parsed data must match the frozen raw output");
       const job = jobs.find((candidate) => candidate.key === `review-${key}`);
       if (!job || job.status !== "complete" || job.result !== raw) fail(`run.reviews.${key}`, "must exactly match the completed review job result");
@@ -495,6 +582,7 @@ export function validateRun(value: unknown): WorkflowRun {
     exactKeys(selection, ["target", "mode", "rationale", "evidenceIds", "selectedAt"], [], "run.writerSelection");
     enumValue(selection.target, MODEL_KEYS, "run.writerSelection.target");
     enumValue(selection.mode, ["automatic", "user"] as const, "run.writerSelection.mode");
+    if (subjects && selection.mode === "automatic") fail("run.writerSelection.mode", "automatic writer selection is disabled for explicit comparison subjects");
     stringValue(selection.rationale, "run.writerSelection.rationale", MAX_LONG);
     const evidenceIds = stringList(selection.evidenceIds, "run.writerSelection.evidenceIds", 0, 100);
     if (reports) {
@@ -505,7 +593,7 @@ export function validateRun(value: unknown): WorkflowRun {
     if (!jobs.some((job) => job.key === "draft")) fail("run.jobs", "missing draft after writer selection");
   }
 
-  if (run.skillDraft !== undefined) validateSkillDraft(stringValue(run.skillDraft, "run.skillDraft", 300_000), asOfDate, targets);
+  if (run.skillDraft !== undefined) validateSkillDraft(stringValue(run.skillDraft, "run.skillDraft", 300_000), asOfDate, subjects ?? targets, run.scope === "overall", subjects ? targets : undefined);
   if (run.error !== undefined) {
     const error = record(run.error, "run.error");
     exactKeys(error, ["code", "message"], ["jobKey"], "run.error");

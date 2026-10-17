@@ -3,7 +3,9 @@ import { lstat, mkdir, open, readdir, realpath, rename, rm, stat, unlink } from 
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import { FIXED_REFERENCE_PATHS, type WorkflowRun } from "./types.ts";
-import { validateRun, validateSkillDraft } from "./validation.ts";
+import { studyScope } from "./scope.ts";
+import { escapeSubjectLabel } from "./subjects.ts";
+import { usageSummarySection, validateRun, validateSkillDraft } from "./validation.ts";
 
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -88,11 +90,13 @@ function stable(value: unknown): string {
 function immutableRunState(run: WorkflowRun): Record<string, unknown> {
   return {
     schemaVersion: run.schemaVersion,
+    scope: run.scope,
     runId: run.runId,
     task: run.task,
     asOfDate: run.asOfDate,
     createdAt: run.createdAt,
     targets: run.targets,
+    subjects: run.subjects,
     limits: run.limits,
   };
 }
@@ -208,11 +212,19 @@ function comparisonMarkdown(run: WorkflowRun): string {
   const lines = [
     "# Model research comparison",
     "",
-    `Evidence as of **${markdown(run.asOfDate)}** for: ${markdown(run.task)}`,
+    `Evidence as of **${markdown(run.asOfDate)}** for: ${markdown(run.scope === "overall" ? studyScope(run.task) : run.task)}`,
     "",
     "Structural validation preserves these model outputs; it does not independently verify their factual claims or URLs.",
     "",
-    "## Compared models", "", "| Target | Author | Exact model | Hosting / transport | Settings |", "|---|---|---|---|---|",
+    ...(run.subjects ? [
+      "## Compared subjects", "",
+      "These are unverified user-supplied labels, not proof of existence, availability, or capability. They are not execution targets. Evidence subject keys A/B refer to this list.", "",
+      "| Subject | Requested model label |", "|---|---|",
+      ...run.subjects.map(subject => `| ${subject.key.toUpperCase()} | ${escapeSubjectLabel(subject.model)} |`), "",
+      "## Research workers", "",
+      "These configured workers produced the reports and reviews; their identities and settings do not describe the compared subjects.", "",
+    ] : ["## Compared models", ""]),
+    `| ${run.subjects ? "Worker" : "Target"} | Author | Exact model | Hosting / transport | Settings |`, "|---|---|---|---|---|",
     ...run.targets.map(target => `| ${target.key.toUpperCase()} | ${markdown(target.modelAuthor)} | ${markdown(target.model)} | ${markdown(`${target.hostingProvider} / ${target.transport}`)} | ${markdown(JSON.stringify(target.settings))} |`), "",
     "## Research arguments",
     "",
@@ -236,13 +248,14 @@ function comparisonMarkdown(run: WorkflowRun): string {
     const disagreements = review.disagreements.map((item) => `${item.topic}: ${item.position} [${item.evidenceIds.join(", ") || "no cited evidence"}]`).join("; ") || "None recorded";
     lines.push(`| ${key.toUpperCase()} | ${markdown(`${review.usefulnessVsOwn.verdict}: ${review.usefulnessVsOwn.explanation}`)} | ${markdown(review.missingEvidence.join("; ") || "None recorded")} | ${markdown(disagreements)} | ${markdown(`${review.writerRecommendation} [${review.writerEvidenceIds.join(", ") || "no qualifying evidence"}]`)} | ${review.confidence} |`);
   }
-  lines.push("", "## Decision", "", `Selected target **${run.writerSelection.target.toUpperCase()}** by **${run.writerSelection.mode}** decision.`, "", markdown(run.writerSelection.rationale), "", `Evidence IDs: ${run.writerSelection.evidenceIds.map(markdown).join(", ") || "none"}`, "");
+  lines.push("", "## Decision", "", `Selected ${run.subjects ? "research worker" : "target"} **${run.writerSelection.target.toUpperCase()}** by **${run.writerSelection.mode}** decision.`, "", markdown(run.writerSelection.rationale), "", `Evidence IDs: ${run.writerSelection.evidenceIds.map(markdown).join(", ") || "none"}`, "");
+  if (run.scope === "overall" && run.skillDraft) lines.push(usageSummarySection(run.skillDraft));
   return lines.join("\n");
 }
 
 function exportFiles(run: WorkflowRun): Map<string, string> {
   if (!run.skillDraft || !run.originals || !run.reviews || !run.writerSelection) throw new Error("Run is not complete enough to export a draft");
-  validateSkillDraft(run.skillDraft, run.asOfDate);
+  validateSkillDraft(run.skillDraft, run.asOfDate, run.subjects ?? run.targets, run.scope === "overall", run.subjects ? run.targets : undefined);
   const files = new Map<string, string>([
     ["SKILL.md", run.skillDraft],
     [FIXED_REFERENCE_PATHS[0], run.originals.a.raw],

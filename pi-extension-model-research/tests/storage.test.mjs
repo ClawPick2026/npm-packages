@@ -4,9 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { advanceRun, createRun } from "../src/engine.ts";
+import { advanceRun, chooseWriter, createRun } from "../src/engine.ts";
 import { FIXED_REFERENCE_PATHS, RECIPROCAL_REVIEW_RUBRIC } from "../src/types.ts";
 import { createRunStore } from "../src/storage.ts";
+import { MODEL_USAGE_TASKS, USAGE_SUMMARY_HEADING } from "../src/scope.ts";
+import { usageSummaryFixture } from "./usage-summary.mjs";
+import { escapeSubjectLabel, normalizeSubjects } from "../src/subjects.ts";
 
 const AS_OF = "2026-05-20";
 const CREATED = "2026-05-20T10:00:00.000Z";
@@ -24,13 +27,14 @@ function target(key) {
   };
 }
 
-function newRun(runId = "storage-run") {
+function newRun(runId = "storage-run", subjects) {
   return createRun({
     runId,
     task: "Choose a model for writing a reusable Pi skill.",
     asOfDate: AS_OF,
     createdAt: CREATED,
     targets: [target("a"), target("b")],
+    ...(subjects === undefined ? {} : { subjects }),
     limits: { maxJobs: 5, perCall: { timeoutMs: 60_000, maxTurns: 8, maxTokens: 12_000 }, expiresAt: EXPIRES },
   });
 }
@@ -100,7 +104,7 @@ function review(key) {
 
 function draft() {
   const links = FIXED_REFERENCE_PATHS.map((reference) => `- [Source record](${reference})`).join("\n");
-  return `---\nname: model-routing-skill-writing\ndescription: Use this dated guide to choose between the two recorded model targets for portable skill writing.\n---\n\n## Routing guidance\n\nAs of ${AS_OF}, compare alpha-1 and beta-1 and route only under the recorded task, model, host, and evidence conditions. This draft recommends a model but does not switch one automatically, and documented support does not establish universal superiority.\n\n## Limits and uncertainty\n\nThe evidence has social access gaps and no controlled head-to-head writing trial. Model updates, host settings, thinking controls, tool access, and unresolved disagreements can change the recommendation. Structural validation does not fact-check URLs or claims.\n\n## Refresh triggers\n\nRefresh after model, provider, price, host-tool, skill-format, or evidence changes, and whenever newer fetched counterevidence becomes available.\n\n## Supporting evidence\n\n${links}\n`;
+  return `---\nname: model-routing-skill-writing\ndescription: Use this dated guide to choose between the two recorded model targets for portable skill writing.\n---\n\n## Routing guidance\n\nAs of ${AS_OF}, compare alpha-1 and beta-1 and route only under the recorded task, model, host, and evidence conditions. This draft recommends a model but does not switch one automatically, and documented support does not establish universal superiority.\n\n## Limits and uncertainty\n\nThe evidence has social access gaps and no controlled head-to-head writing trial. Model updates, host settings, thinking controls, tool access, and unresolved disagreements can change the recommendation. Structural validation does not fact-check URLs or claims.\n\n## Refresh triggers\n\nRefresh after model, provider, price, host-tool, skill-format, or evidence changes, and whenever newer fetched counterevidence becomes available.\n\n## Supporting evidence\n\n${links}\n\n${usageSummaryFixture()}`;
 }
 
 class CompleteRuntime {
@@ -166,6 +170,9 @@ test("locks are exclusive, never auto-steal, and save rejects missing or mismatc
   const envelope = await store.read(first.runId);
   envelope.run.task = "rewritten identity";
   await assert.rejects(store.save(envelope, lock), /immutable/);
+  const withoutScope = await store.read(first.runId);
+  delete withoutScope.run.scope;
+  await assert.rejects(store.save(withoutScope, lock), /immutable/);
   await assert.rejects(store.save(await store.read(second.runId), lock), /matching run lock/);
   await lock.release();
   await assert.rejects(store.save(await store.read(first.runId), lock), /live matching run lock/);
@@ -245,9 +252,28 @@ test("draft export is fixed, private, complete, and contains raw references plus
       "https://example.com/a/skill-writing", "fetched", "documented", "Same prompt", "No controlled head-to-head",
       "Confidence", "Usefulness versus own report", "bounded disagreement", "Writer recommendation",
     ]) assert.ok(comparison.includes(expected), `comparison should include ${expected}`);
+    assert.ok(comparison.endsWith(usageSummaryFixture()));
+    for (const task of MODEL_USAGE_TASKS) assert.ok(comparison.includes(`| ${task} |`));
+    assert.ok(comparison.indexOf(USAGE_SUMMARY_HEADING) > comparison.indexOf("## Decision"));
 
     const repeated = await store.exportDraft(run.runId, lock);
     assert.equal(repeated.created, false, "an identical complete export is idempotently inspectable");
+  });
+});
+
+test("legacy completed exports keep their pre-summary layout and remain idempotent", async t => {
+  const { store } = await fixture(t);
+  const run = await completedRun("legacy-export");
+  delete run.scope;
+  run.skillDraft = run.skillDraft.replace(usageSummaryFixture(), "");
+  run.jobs.find(job => job.key === "draft").result = run.skillDraft;
+  await store.create(run);
+  await store.withRunLock(run.runId, async lock => {
+    const result = await store.exportDraft(run.runId, lock);
+    const comparison = await readFile(path.join(result.outputDir, "comparison.md"), "utf8");
+    assert.equal(comparison.includes(USAGE_SUMMARY_HEADING), false);
+    assert.match(comparison, /Evidence IDs: a-ev-1\n$/);
+    assert.equal((await store.exportDraft(run.runId, lock)).created, false);
   });
 });
 
@@ -274,4 +300,96 @@ test("incomplete runs cannot export and export paths remain fixed below run draf
     await assert.rejects(store.exportDraft(run.runId, lock), /Only a complete run/);
   });
   assert.equal(path.resolve(root, "runs", run.runId, "draft").startsWith(path.resolve(root) + path.sep), true);
+});
+
+test("subject labels survive locked save/reload and cannot be changed, removed, reordered, or added to legacy runs", async t => {
+  const { store } = await fixture(t);
+  const subjects = normalizeSubjects(["gpt-6.1-sol", "claude-opus-5.5"]);
+  const run = newRun("explicit-subject-storage", subjects);
+  await store.create(run);
+  await store.withRunLock(run.runId, async lock => {
+    const envelope = await store.read(run.runId);
+    assert.deepEqual(envelope.run.subjects, subjects);
+    envelope.run.jobs[0].status = "pending";
+    envelope.run.jobs[0].taskId = "configured-worker-task";
+    await store.save(envelope, lock);
+    const reloaded = await store.read(run.runId);
+    assert.deepEqual(reloaded.run.subjects, subjects);
+    assert.equal(reloaded.run.jobs[0].taskId, "configured-worker-task");
+    for (const changed of [
+      undefined,
+      normalizeSubjects(["replacement", subjects[1].model]),
+      normalizeSubjects([subjects[1].model, subjects[0].model]),
+    ]) {
+      const mutation = await store.read(run.runId);
+      if (changed === undefined) delete mutation.run.subjects;
+      else mutation.run.subjects = changed;
+      await assert.rejects(store.save(mutation, lock), /immutable/);
+    }
+    assert.deepEqual((await store.read(run.runId)).run.subjects, subjects);
+  });
+
+  const legacy = newRun("legacy-cannot-add-subjects");
+  await store.create(legacy);
+  await store.withRunLock(legacy.runId, async lock => {
+    const envelope = await store.read(legacy.runId);
+    envelope.run.subjects = subjects;
+    await assert.rejects(store.save(envelope, lock), /immutable/);
+    assert.equal(Object.hasOwn((await store.read(legacy.runId)).run, "subjects"), false);
+  });
+});
+
+test("explicit exports separate compared subjects and research workers, retain raw identities, and are byte-identical on repeat", async t => {
+  const { store, root } = await fixture(t);
+  const subjects = normalizeSubjects(["<unknown>&[model]|a\\b", "same-author/unknown-2"]);
+  const run = newRun("explicit-subject-export", subjects);
+  const legacyRuntime = new CompleteRuntime();
+  const runtime = {
+    kind: "pi",
+    async start(job) {
+      const outcome = await legacyRuntime.start(job);
+      if (job.stage === "research") outcome.text = JSON.stringify({ ...JSON.parse(outcome.text), subjects });
+      else if (job.stage === "review") outcome.text = JSON.stringify({ ...JSON.parse(outcome.text), writerRecommendation: "undetermined", writerEvidenceIds: [] });
+      else outcome.text = outcome.text.replace("alpha-1 and beta-1", subjects.map(subject => escapeSubjectLabel(subject.model)).join(" and "))
+        .replace(usageSummaryFixture(), usageSummaryFixture(escapeSubjectLabel(subjects[0].model), 73));
+      return outcome;
+    },
+    async check() { throw new Error("not pending"); },
+    async cancel() {},
+  };
+  await advanceRun(run, runtime, () => {});
+  assert.equal(run.status, "awaiting_writer");
+  chooseWriter(run, "b");
+  await advanceRun(run, runtime, () => {});
+  assert.equal(run.status, "complete");
+  await store.create(run);
+  const recordPath = path.join(root, "runs", run.runId, "record.json");
+  const originalRecord = await readFile(recordPath, "utf8");
+  await store.withRunLock(run.runId, async lock => {
+    const result = await store.exportDraft(run.runId, lock);
+    const comparison = await readFile(path.join(result.outputDir, "comparison.md"), "utf8");
+    assert.ok(comparison.includes("## Compared subjects"));
+    assert.ok(comparison.includes("## Research workers"));
+    assert.ok(comparison.includes("not proof of existence, availability, or capability"));
+    const subjectSection = comparison.split("## Compared subjects")[1].split("## Research workers")[0];
+    for (const subject of subjects) assert.ok(subjectSection.includes(escapeSubjectLabel(subject.model)));
+    assert.equal(subjectSection.includes("alpha-1"), false);
+    const workersSection = comparison.split("## Research workers")[1].split("## Research arguments")[0];
+    for (const worker of run.targets) assert.ok(workersSection.includes(worker.model));
+    assert.ok(comparison.includes("Selected research worker **B** by **user** decision."));
+    assert.ok(comparison.endsWith(usageSummaryFixture(escapeSubjectLabel(subjects[0].model), 73)));
+    for (const key of ["a", "b"]) {
+      const raw = await readFile(path.join(result.outputDir, `references/research-${key}.json`), "utf8");
+      assert.equal(raw, run.originals[key].raw);
+      assert.deepEqual(JSON.parse(raw).subjects, subjects);
+      assert.deepEqual(JSON.parse(raw).researcher, target(key));
+    }
+    const before = await Promise.all(result.files.map(file => readFile(path.join(result.outputDir, file), "utf8")));
+    assert.equal((await store.exportDraft(run.runId, lock)).created, false);
+    const after = await Promise.all(result.files.map(file => readFile(path.join(result.outputDir, file), "utf8")));
+    assert.deepEqual(after, before);
+    assert.equal(await readFile(recordPath, "utf8"), originalRecord, "export must not migrate or rewrite persisted records");
+    await writeFile(path.join(result.outputDir, "comparison.md"), "user edit", { mode: 0o600 });
+    await assert.rejects(store.exportDraft(run.runId, lock), /differs/);
+  });
 });
